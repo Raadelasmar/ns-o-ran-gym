@@ -330,6 +330,17 @@ class SQLiteDatabaseAPI:
         result = self.cursor.execute(query, (timestamp,)).fetchall()
         return result if result else None # [(observation_tuple)]
 
+    @lock_connection
+    def has_kpms(self, timestamp: int) -> bool:
+        """Read-only existence check: True iff at least one KPM row exists at `timestamp`
+        in the per-cell DU table. Used by the env to detect the episode-boundary step where
+        last_timestamp was advanced (from bsState) past the last KPM period, so read_kpms()
+        would return None. Additive: does not affect read_kpms()'s None contract.
+        """
+        result = self.cursor.execute(
+            "SELECT 1 FROM du WHERE timestamp = ? LIMIT 1", (timestamp,)).fetchone()
+        return result is not None
+
     @staticmethod
     def extract_cellId(filepath) -> int:
         # Define a regular expression pattern to match the number at the end of the path

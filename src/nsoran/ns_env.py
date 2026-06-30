@@ -366,21 +366,47 @@ class NsOranEnv(gym.Env):
         if not self.is_simulation_over():
             # Take a step in the environment based on the given action
             actions = self._compute_action(action)
-            
+
             # Update the environment state and calculate the reward
             self.action_controller.create_control_action(self.last_timestamp, actions)
             # the action was written: notify the environment
             self.controlSemaphore.release()
-            
-            self._wait_data_availability()            
-            self._fill_datalake()
-        
-        if self.return_info:
-            return_tuple = (self._get_obs(), self._compute_reward(), self.terminated, self.truncated, self.render()) 
-        else:
-            return_tuple = (self._get_obs(), self._compute_reward(), self.terminated, self.truncated, {})
 
-        return return_tuple
+            self._wait_data_availability()
+            self._fill_datalake()
+
+            # Boundary step: ns-3 has run to Simulator::Stop but its process is not yet reaped
+            # (poll() is None, so is_simulation_over() above returned False), so we entered this
+            # block. On this final step last_timestamp can be advanced (from bsState.txt,
+            # es_env.py) past the last KPM period: no KPM rows exist at last_timestamp, so
+            # read_kpms() returns None and _get_obs()/_compute_reward() would crash. Detect the
+            # empty-observation condition here and return a terminal tuple. This is a time-limit
+            # end, so set the same flags as is_simulation_over()'s return_code==0 branch.
+            if not self.datalake.has_kpms(self.last_timestamp):
+                self.terminated = True
+                self.truncated = True
+                terminal_obs = [tuple([0.0] * len(self.columns_state))]
+                if self.return_info:
+                    return (terminal_obs, 0.0, self.terminated, self.truncated, self.render())
+                return (terminal_obs, 0.0, self.terminated, self.truncated, {})
+
+            if self.return_info:
+                return_tuple = (self._get_obs(), self._compute_reward(), self.terminated, self.truncated, self.render())
+            else:
+                return_tuple = (self._get_obs(), self._compute_reward(), self.terminated, self.truncated, {})
+
+            return return_tuple
+
+        # ns-3 has hit Simulator::Stop and exited (episode boundary): read_kpms() finds no
+        # rows, so _get_obs()/_compute_reward() would crash. self.terminated/self.truncated
+        # were already set inside is_simulation_over(). Return a valid terminal 5-tuple.
+        # NOTE: terminal obs is ES-use-case shaped (len(self.columns_state)); ts_env returns a
+        # different structure. This base-class terminal return is correct for EnergySavingEnv
+        # (the env we run); revisit if TrafficSteeringEnv is ever run to its episode boundary.
+        terminal_obs = [tuple([0.0] * len(self.columns_state))]
+        if self.return_info:
+            return (terminal_obs, 0.0, self.terminated, self.truncated, self.render())
+        return (terminal_obs, 0.0, self.terminated, self.truncated, {})
     
     def _fill_datalake(self):
         """Helper function that collects from the csv files the latest kpms and uploads them in the Datalake
