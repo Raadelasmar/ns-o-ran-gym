@@ -155,8 +155,24 @@ class SQLiteDatabaseAPI:
             
             # Remove special characters using regular expression
             column_name = re.sub(r'[^\w\s]', '', column_name)
-            
+
             return column_name
+
+    @staticmethod
+    def _coerce_value(value, col_type):
+        if value is None or value == '':
+            return None
+        if col_type == 'INTEGER':
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+        if col_type == 'REAL':
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        return value
 
     def acquire_connection(self):
         self.connection = sqlite3.connect(self.database_path)
@@ -240,7 +256,14 @@ class SQLiteDatabaseAPI:
         
         # Filter kpms dictionary to only include acceptable columns
         filtered_kpms = {key: value for key, value in data.items() if key in admitted_keys}
-        
+
+        # Coerce to the declared column type before insert. csv.DictReader yields strings;
+        # SQLite affinity converts well-formed numerics but stores anything else as TEXT
+        # (e.g. '-inf' outage markers, '' empty neighbor cells), which later breaks numeric
+        # comparisons in the envs. Python float() parses '-inf'; '' becomes NULL.
+        filtered_kpms = {key: self._coerce_value(value, admitted_keys[key])
+                         for key, value in filtered_kpms.items()}
+
         if not filtered_kpms:
             raise ValueError("No acceptable columns found in the input dictionary.")
         

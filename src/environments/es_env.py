@@ -375,8 +375,11 @@ class EnergySavingEnv(NsOranEnv):
         df['RLF_Counter'] = 0.0
         df['RLF_VALUE'] = 0
         columns += ['RLF_Counter', 'RLF_VALUE']
-        # Replace -inf values in 'L3 serving SINR' with 0
-        df['L3 serving SINR'] = df['L3 serving SINR'].replace(-np.inf, 0)
+        # Defensive coercion (no-op now that the datalake types inserts; guards stale DBs).
+        # A -inf serving SINR is a UE in outage; it stays -inf so the < -5 test below
+        # counts it as an RLF (Option B, chosen 2026-07, per the RLF definition at the
+        # top of this file and the < -5 outage treatment in lte-enb-rrc.cc:4755).
+        df['L3 serving SINR'] = pd.to_numeric(df['L3 serving SINR'], errors='coerce')
         # Group by timestamp and nrCellId for efficient processing
         grouped = df.groupby(['timestamp', 'nrCellId'])
         # Iterate through each group
