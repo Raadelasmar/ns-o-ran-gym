@@ -412,7 +412,10 @@ class NsOranEnv(gym.Env):
         """Helper function that collects from the csv files the latest kpms and uploads them in the Datalake
         """
         self.datalake.acquire_connection()
-        for file_path in glob.glob(os.path.join(self.sim_path, 'cu-up-cell-*.txt')):
+        # Ascending-cellId order: with the datalake's (timestamp, ueImsiComplete)
+        # dedup, the file iterated first wins a cross-file collision, so file
+        # order must be deterministic (glob.glob returns directory order).
+        for file_path in sorted(glob.glob(os.path.join(self.sim_path, 'cu-up-cell-*.txt')), key=SQLiteDatabaseAPI.extract_cellId):
             with open(file_path, 'r') as csvfile:
                 for row in csv.DictReader(csvfile):
                     timestamp = int(row['timestamp'])
@@ -425,7 +428,7 @@ class NsOranEnv(gym.Env):
                             self.datalake.insert_gnb_cu_up(row)
                         self.last_timestamp = timestamp
 
-        for file_path in glob.glob(os.path.join(self.sim_path, 'cu-cp-cell-*.txt')):            
+        for file_path in sorted(glob.glob(os.path.join(self.sim_path, 'cu-cp-cell-*.txt')), key=SQLiteDatabaseAPI.extract_cellId):
             with open(file_path, 'r') as csvfile:
                 for row in csv.DictReader(csvfile):
                     timestamp = int(row['timestamp'])
@@ -438,7 +441,7 @@ class NsOranEnv(gym.Env):
                             self.datalake.insert_gnb_cu_cp(row)
                         self.last_timestamp = timestamp
 
-        for file_path in glob.glob(os.path.join(self.sim_path, 'du-cell-*.txt')):     
+        for file_path in sorted(glob.glob(os.path.join(self.sim_path, 'du-cell-*.txt')), key=SQLiteDatabaseAPI.extract_cellId):
             with open(file_path, 'r') as csvfile:
                 for row in csv.DictReader(csvfile):
                     timestamp = int(row['timestamp'])

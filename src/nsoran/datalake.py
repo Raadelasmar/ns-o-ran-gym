@@ -118,6 +118,16 @@ class SQLiteDatabaseAPI:
         "DRB.UEThpDlPdcpBased.UEID": "REAL"
     }
 
+    # On a (timestamp, ueImsiComplete) collision — the same UE reported by more
+    # than one cell file in the same tick (source and target both hold the UE's
+    # RRC context during a handover) — keep the row with the SMALLEST value in
+    # the column named here. For gnb_cu_cp that is the worst L3 serving SINR,
+    # so an outage marker (-inf) always survives ingestion and is counted as an
+    # RLF (Option B). Tables not listed keep the first row ingested; ns_env
+    # iterates files in ascending cellId order, so that survivor is the lowest
+    # reporting cellId.
+    collision_keep_min = {"gnb_cu_cp": "L3 serving SINR"}
+
     debug: bool = False
 
     def __init__(self, simulation_dir, num_ues_gnb, debug=False):
@@ -268,8 +278,24 @@ class SQLiteDatabaseAPI:
             raise ValueError("No acceptable columns found in the input dictionary.")
         
         if self.entry_exists(table_name,timestamp=filtered_kpms['timestamp'], ue_imsi_complete=filtered_kpms['ueImsiComplete']):
-            # we already inserted this in the DB, no need to do it again
-            return
+            pref_col = self.collision_keep_min.get(table_name)
+            new_val = filtered_kpms.get(pref_col) if pref_col is not None else None
+            if new_val is None:
+                # No collision preference for this table (or the new row has no
+                # comparable value): keep the first row ingested.
+                return
+            key_cols = (SQLiteDatabaseAPI.sanitize_column_name('timestamp'),
+                        SQLiteDatabaseAPI.sanitize_column_name('ueImsiComplete'))
+            key_vals = (filtered_kpms['timestamp'], filtered_kpms['ueImsiComplete'])
+            stored = self.cursor.execute(
+                f"SELECT {SQLiteDatabaseAPI.sanitize_column_name(pref_col)} FROM {table_name} "
+                f"WHERE {key_cols[0]} = ? AND {key_cols[1]} = ?", key_vals).fetchone()[0]
+            if stored is not None and stored <= new_val:
+                return
+            # The new row is strictly worse: replace the stored row wholesale so
+            # the kept row remains one cell's coherent view of the UE.
+            self.cursor.execute(
+                f"DELETE FROM {table_name} WHERE {key_cols[0]} = ? AND {key_cols[1]} = ?", key_vals)
 
         placeholders = ', '.join(['?' for _ in filtered_kpms.values()])
         columns = ', '.join([SQLiteDatabaseAPI.sanitize_column_name(col_name) for col_name in filtered_kpms.keys()])
