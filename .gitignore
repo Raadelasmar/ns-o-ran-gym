@@ -166,3 +166,5 @@ output/*
 time.csv
 *.pdf
 *.pgf
+*.bak
+build_log*.txt
