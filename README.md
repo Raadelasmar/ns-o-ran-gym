@@ -1,3 +1,24 @@
+> ## About this fork
+>
+> Part of the BME / Nokia Bell Labs project **"Hybrid SON and Multi-Agent AI for Autonomous
+> Optimization of Future Mobile Networks."**
+>
+> This fork adds, on top of the upstream environment:
+> - a compound cell-load metric and its validation tooling (`analysis/`)
+> - CIO experiment drivers (`examples/cio_experiment.py`, `examples/cio_headroom.py`)
+> - a before/after run comparison tool (`compare_runs.py`)
+> - fixes to the datalake ingestion and episode-boundary handling (`src/nsoran/`)
+>
+> See **[CONTRIBUTIONS.md](CONTRIBUTIONS.md)** for exactly what was created and modified,
+> with line counts derived from git.
+>
+> **Companion repository (required):**
+> [Raadelasmar/ns-o-ran-ns3-mmwave](https://github.com/Raadelasmar/ns-o-ran-ns3-mmwave) —
+> the ns-3 simulator fork containing the CIO control lever this environment drives.
+>
+> *Original upstream README follows.*
+
+---
 # A Gymnasium Environment for ns-O-RAN
 
 This repository contains a package for a [gymnasium](https://gymnasium.farama.org/) based reinforcement learning environment for the 5G O-RAN architecture through the [`ns-O-RAN`](https://openrangym.com/ran-frameworks/ns-o-ran) simulator.
