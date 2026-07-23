@@ -168,3 +168,4 @@ time.csv
 *.pgf
 *.bak
 build_log*.txt
+output/
