@@ -1,55 +1,19 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "nsoran"
-dynamic = ["version"]
-description = 'Gymnasium environment for ns-O-RAN.'
+name = "ns_o_ran_gym"
+version = "0.1.0"
+description = "O-RAN MARL Gymnasium environment for ns-3 mmWave"
 readme = "README.md"
 requires-python = ">=3.8"
-keywords = ["gymnasium", "gym", "ns-3", "o-ran", "5g", "ns-O-RAN"]
-authors = [
-  { name = "Andrea Lacava", email = "thecave003@gmail.com" },
-  { name = "Tommaso Pietrosanti", email = "pietrosantitommaso@protonmail.com" },
-  { name = "Matteo Bordin", email = "matbord97@gmail.com" }
+dependencies = [
+    "pyzmq",
+    "numpy",
+    "gymnasium"
 ]
 
-maintainers = [
-  { name = "Andrea Lacava", email = "thecave003@gmail.com" }
-]
-
-classifiers = [
-  "Development Status :: 4 - Beta",
-  "Programming Language :: Python",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy",
-]
-
-dependencies =  [
-  "gymnasium>=0.29.0",
-  "posix-ipc>=1.1.1",
-  "typing>=3.7.4.3",
-  "pandas>=2.2.3",
-  "numpy>=2.1.1",
-  "sem>=0.3.9.1"
-]
-
-[project.urls]
-Homepage = "https://openrangym.com/ran-frameworks/ns-o-ran"
-Package = "https://pypi.org/project/nsoran/"
-Source = "https://github.com/wineslab/ns-o-ran-gym"
-"Bug Tracker" = "https://github.com/wineslab/ns-o-ran-gym/issues"
-
-[tool.hatch.version]
-path = "VERSION"
-pattern = "(?P<version>\\d+\\.\\d+\\.\\d+)"
-
-[tool.hatch.build.targets.wheel]
-packages = ['src/nsoran', 'src/environments']
-sources = ["src"]
+# Tell setuptools: "When someone imports 'ns_o_ran_gym', look in the current directory (.)"
+[tool.setuptools]
+package-dir = {"ns_o_ran_gym" = "."}
