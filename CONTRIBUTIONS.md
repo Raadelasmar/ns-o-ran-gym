@@ -28,6 +28,8 @@ git ls-files | wc -l                                       # total tracked files
 | `analysis/cio_conditions_analysis.py` | 95 | Cross-condition analysis for the CIO experiments (C0–C4). Computes per-cell episode means (load under two weightings), handover counts, RLF-row counts, delivered volume, and backlog from a run's `database.db` and its handover trace. |
 | `examples/cio_experiment.py` | 83 | Driver that runs one CIO experiment condition (a static per-cell dB bias) at 21 UEs, seed 555, by reusing `EnergySavingEnv` with the control file swapped to the CIO lever. This is the driver behind conditions C0–C4. |
 | `examples/cio_headroom.py` | 83 | The V30 headroom-scan variant of the CIO driver. Functionally identical to `examples/cio_experiment.py` except the scenario config uses `ues: [5]` (35 UEs) instead of `[3]`. Note: its docstring was not updated and still describes the 21-UE C0–C4 conditions from the sibling file. |
+| `tests/test_server.py` | 54 | Standalone test bridge script to validate the `ZmqStateDatabase` class, test time-series delta retrieval, and verify the synchronous bidirectional ns-3 handshake. |
+| `bridge/zmq_database.py` | 101 | Defines a ZeroMQ server class that acts as an in-memory database and communication bridge to exchange JSON-formatted state updates and control actions between the ns3 simulator and a Python environment. |
 
 ## Table 2 — Files modified
 
@@ -37,14 +39,15 @@ git ls-files | wc -l                                       # total tracked files
 | `src/environments/scenario_configurations/es_use_case.json` | +54 / −17 | Reformatted from single-line arrays to multi-line, and added one new key `e2nrEnabled: [1]`. The added key is the only semantic change; the remaining diff is whitespace reformatting. |
 | `src/nsoran/ns_env.py` | +41 / −12 | Restructured `step()` to handle the episode-boundary step: when `last_timestamp` has been advanced past the last KPM period (no rows exist, so `read_kpms()` returns None), it now returns a valid terminal 5-tuple with a zero observation instead of crashing. Also sorts the `cu-up` / `cu-cp` / `du` file globs by ascending cellId (`extract_cellId`) so cross-file collisions dedup deterministically. |
 | `src/environments/es_env.py` | +5 / −2 | In the RLF-counter path, replaced `df['L3 serving SINR'].replace(-np.inf, 0)` with `pd.to_numeric(..., errors='coerce')` so outage rows keep their `-inf` value and are counted as an RLF by the downstream `< -5` test. Added comment documents the "Option B" RLF definition. |
-| `.gitignore` | +2 / −0 | Added `*.bak` and `build_log*.txt` ignore patterns. |
+| `.gitignore` | +3 / −0 | Added `*.bak`, `build_log*.txt` and `output/` ignore patterns. |
+| `pyproject.toml` | 19 | Build system configuration to allow editable (`pip install -e .`) package installation, resolving local `ns_o_ran_gym` module import paths cleanly across the environment. |
 
 ## Summary
 
-- **Total lines added:** 1,576 (of which 1,410 are in the 10 new files; 166 in modified files). 35 lines removed.
-- **Files created:** 10
-- **Files modified:** 5
-- **Files untouched:** 26 (of 41 tracked files total)
+- **Total lines added:** 1,817 (of which 1,565 are in the 12 new files; 252 in modified files). 83 lines removed.
+- **Files created:** 12
+- **Files modified:** 6
+- **Files untouched:** 25 (of 41 tracked files total)
 
 ## Line-level authorship
 
