@@ -11,7 +11,8 @@ requires-python = ">=3.8"
 dependencies = [
     "pyzmq",
     "numpy",
-    "gymnasium"
+    "gymnasium",
+    "matplotlib"
 ]
 
 # Tell setuptools: "When someone imports 'ns_o_ran_gym', look in the current directory (.)"

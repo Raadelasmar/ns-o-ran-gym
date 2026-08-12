@@ -36,13 +36,21 @@ class ZmqStateDatabase:
         self.is_connected = True
         logger.info(f"ZeroMQ Database Bridge listening on {bind_address}")
 
-    def recv_kpi_update(self) -> Dict[str, Any]:
+    def recv_kpi_update(self, timeout_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Blocks until ns-3 transmits the latest KPI payload, stores it in the
         in-memory history, and returns the parsed cell dictionary.
+
+        If timeout_ms is given and no message arrives within it, returns None
+        instead of blocking forever -- lets a caller re-check whether ns-3 is
+        still alive (e.g. between control steps, once the simulation has
+        exited and will never send again) without hanging on recv().
         """
         if not self._socket or not self.is_connected:
             raise RuntimeError("ZeroMQ socket is not bound. Call start() first.")
+
+        if timeout_ms is not None and not self._socket.poll(timeout=timeout_ms, flags=zmq.POLLIN):
+            return None
 
         raw_message = self._socket.recv()
         payload = json.loads(raw_message.decode("utf-8"))
