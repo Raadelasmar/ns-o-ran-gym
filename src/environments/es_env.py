@@ -1,8 +1,9 @@
 from typing_extensions import override
 import numpy as np
 import pandas as pd
-from nsoran.ns_env import NsOranEnv 
+from nsoran.ns_env import NsOranEnv
 import pandas as pd
+import bisect
 import glob
 import csv
 import os
@@ -44,6 +45,167 @@ import os
 # - RRU_PRBUSEDDL: Physical resource block usage for downlink.
 # - TB_TOTNBRDLINITIAL_64QAM, TB_TOTNBRDLINITIAL_QPSK, TB_TOTNBRDLINITIAL_16QAM: Transport block metrics by modulation scheme.
 # - ES_STATE: Energy-saving state (1 = OFF, 0 = ON).
+
+
+# --------------------------------------------------------------------------
+# Raw handover-event ingestion
+#
+# Stores handover EVENTS, not ping-pong counts: detection windows stay tunable
+# in the reward code without re-running the simulation.
+#
+# These are module-level functions rather than methods on purpose. They receive
+# only the datalake and the run directory, so they have no access to the env and
+# therefore *cannot* read or write self.last_timestamp -- that is a structural
+# guarantee, not a convention (RULE 2). It also makes them testable without
+# constructing an env.
+# --------------------------------------------------------------------------
+
+BSSTATE_FILE = 'bsState.txt'
+HANDOVER_START_FILE = 'UeHandoverStartStats.txt'
+
+# UeHandoverStartStats.txt: space-separated, no header, 5 fields written by
+# MmWaveBearerStatsConnector::PrintUeStartHandover
+# (mmwave-bearer-stats-connector.cc:683) as
+#     Simulator::Now().GetNanoSeconds()/1.0e9  imsi  rnti  sourceCellid  targetCellId
+# NB: the print order is NOT the function's parameter order -- rnti is 3rd here.
+HO_COL_TIME_S, HO_COL_IMSI, HO_COL_RNTI, HO_COL_SRC, HO_COL_DST = range(5)
+
+# UNIQUE is on (time_s, imsi) -- a key that actually distinguishes events and is
+# never NULL. (time_s alone is not unique: two UEs can hand over in the same
+# nanosecond.) A UNIQUE over a column that is always NULL, as the bsState table
+# has, silently no-ops in SQLite and permits duplicates.
+HANDOVERS_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS handovers ("
+    "timestamp INTEGER, "   # du-grid timestamp this handover is assigned to
+    "time_s REAL, "         # raw sim seconds from the file, kept for debugging
+    "imsi INTEGER, "
+    "src_cell INTEGER, "
+    "dst_cell INTEGER, "
+    "UNIQUE (time_s, imsi))"
+)
+
+
+def _with_connection(datalake, fn):
+    """Run fn() with an open datalake connection, mirroring lock_connection.
+
+    _fill_datalake_usecase runs inside an already-open connection while
+    _init_datalake_usecase runs after the constructor released it, so both
+    cases must work.
+    """
+    need_connection = datalake.connection is None
+    if need_connection:
+        datalake.acquire_connection()
+    try:
+        return fn()
+    finally:
+        if need_connection:
+            datalake.release_connection()
+
+
+def create_handovers_table(datalake) -> None:
+    """Create the `handovers` table.
+
+    Deliberately does NOT go through datalake._create_table, which appends a
+    hardcoded UNIQUE (timestamp, ueImsiComplete); this table has no
+    ueImsiComplete column, so that statement would not even execute. The table
+    is likewise not registered in datalake.tables, to keep read_kpms from
+    discovering its `timestamp` column and joining it into observation queries.
+    """
+    _with_connection(datalake, lambda: datalake.cursor.execute(HANDOVERS_TABLE_SQL))
+
+
+def read_kpm_offset(sim_path: str) -> int:
+    """Recover this run's KPM-timestamp offset, in ms, from bsState.txt.
+
+    The KPM timestamp is built in ns-3 as
+        timestamp = m_startTime + Simulator::Now().GetMilliSeconds()
+    (mmwave-enb-net-device.cc:1440), where m_startTime is wall-clock ms since
+    the Unix epoch at MmWaveHelper construction (mmwave-helper.cc:3299). It
+    therefore differs for every run and must never be hardcoded (RULE 4).
+
+    bsState.txt carries both the sim time and the KPM timestamp on every row
+    (scenario-three.cc:63), so the offset is recoverable per run as
+    UNIX - Timestamp*1000. Raises if it is not constant.
+    """
+    path = os.path.join(sim_path, BSSTATE_FILE)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'cannot recover the KPM offset, missing {path}')
+
+    offsets = set()
+    with open(path, 'r') as bsfile:
+        for row in csv.DictReader(bsfile, delimiter=' '):
+            unix, sim_s = row.get('UNIX'), row.get('Timestamp')
+            if not unix or not sim_s:
+                continue
+            offsets.add(int(unix) - round(float(sim_s) * 1000))
+
+    if not offsets:
+        raise ValueError(f'no usable rows in {path}; cannot recover the KPM offset')
+    if len(offsets) > 1:
+        raise ValueError(
+            f'KPM offset is not constant across {path}: found {sorted(offsets)}')
+    return offsets.pop()
+
+
+def ingest_handovers(datalake, sim_path: str) -> int:
+    """Ingest raw handover events into `handovers`; return rows newly inserted.
+
+    Each file row is mapped onto the du grid as
+        kpm_ts = offset + round(time_s * 1000)
+    snapped to the greatest du timestamp <= kpm_ts, i.e. the step-window the
+    event falls in. Events past the last du tick are assigned to that last tick
+    rather than dropped (RULE 1); events before the first tick, which do not
+    occur in practice, are clamped up to it so that no event is ever lost.
+
+    Insertion is INSERT OR IGNORE on (time_s, imsi), so this may be called on
+    every step -- the file grows during a live run -- and each event still lands
+    exactly once (RULE 3). That is why re-reading the whole file is safe here,
+    and why the bsState `timestamp >= last_timestamp` inclusive re-read pattern
+    (which duplicated a tick in the audited run) is not copied.
+    """
+    path = os.path.join(sim_path, HANDOVER_START_FILE)
+    if not os.path.isfile(path):
+        return 0
+
+    offset = read_kpm_offset(sim_path)   # RULE 4: re-read per run, every call
+
+    def _ingest():
+        grid = [row[0] for row in datalake.cursor.execute(
+            'SELECT DISTINCT timestamp FROM du ORDER BY timestamp').fetchall()]
+        if not grid:
+            # No KPM grid yet: nothing to snap onto. Events stay in the file and
+            # are picked up on a later call.
+            return 0
+
+        events = []
+        with open(path, 'r') as hofile:
+            for line in hofile:
+                fields = line.split()
+                if len(fields) != 5:
+                    continue
+                time_s = float(fields[HO_COL_TIME_S])
+                kpm_ts = offset + round(time_s * 1000)
+                # bisect_right so an event landing exactly on a tick belongs to
+                # that tick's window; pos == len(grid) means the event is past
+                # the last tick and clamps onto it.
+                pos = bisect.bisect_right(grid, kpm_ts)
+                events.append((
+                    grid[pos - 1] if pos else grid[0],
+                    time_s,
+                    int(fields[HO_COL_IMSI]),
+                    int(fields[HO_COL_SRC]),
+                    int(fields[HO_COL_DST]),
+                ))
+
+        count_sql = 'SELECT COUNT(*) FROM handovers'
+        before = datalake.cursor.execute(count_sql).fetchone()[0]
+        datalake.cursor.executemany(
+            'INSERT OR IGNORE INTO handovers '
+            '(timestamp, time_s, imsi, src_cell, dst_cell) VALUES (?, ?, ?, ?, ?)',
+            events)
+        return datalake.cursor.execute(count_sql).fetchone()[0] - before
+
+    return _with_connection(datalake, _ingest)
 
 
 class EnergySavingEnv(NsOranEnv):
@@ -216,8 +378,9 @@ class EnergySavingEnv(NsOranEnv):
             "on_cost": "REAL",
             "reward": "REAL"
         } 
-        self.datalake._create_table("bsState",self.gnb_state_keys)  
-        self.datalake._create_table("grafana",grafana_keys)  
+        self.datalake._create_table("bsState",self.gnb_state_keys)
+        self.datalake._create_table("grafana",grafana_keys)
+        create_handovers_table(self.datalake)
         return super()._init_datalake_usecase()
 
     @override
@@ -238,6 +401,11 @@ class EnergySavingEnv(NsOranEnv):
                         self.datalake.insert_data("bsState", db_row)
                         # Update the last timestamp
                         self.last_timestamp = timestamp
+
+        # Raw handover events. Idempotent on (time_s, imsi), so calling this on
+        # every step neither duplicates nor drops events, and it deliberately
+        # does not participate in the last_timestamp bookkeeping above.
+        ingest_handovers(self.datalake, self.sim_path)
 
     def ue_centric_tocell_centric(self, df):
         """Function used to clean the dataframe with ns-3 row data

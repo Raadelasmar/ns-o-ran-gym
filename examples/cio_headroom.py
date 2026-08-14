@@ -11,6 +11,8 @@ ns-3's SetCellIndividualOffset is idempotent.
 Usage:
     python examples/cio_experiment.py                 # C0: all cells 0 dB
     python examples/cio_experiment.py --cell 3 --bias -6   # C4
+    python examples/cio_experiment.py --trafficModel 1 --minSpeed 2 --maxSpeed 4 \
+        --handoverMode FixedTtt                           # scenario knob sweep
 Conditions on record (all seed 555):
     C0 0 dB everywhere      -> output/5d523414-...  (md5 38e5f1bb, = baseline d7d1d669)
     C1 cell 2 -3 dB         -> output/c68313fb-...  (md5 ac0afa81)
@@ -55,9 +57,27 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=555)
     ap.add_argument("--ns3_path", default=path.expanduser("~/oran-project/ns-3-mmwave-oran"))
     ap.add_argument("--output_folder", default=path.join(path.dirname(__file__), "..", "output"))
+    # Scenario knobs: omit a flag to leave CFG exactly as defined above.
+    # minSpeed/maxSpeed are absent from CFG by default, so omitting them lets ns-3 use its own.
+    ap.add_argument("--trafficModel", type=int, choices=[0, 1, 2, 3], default=None,
+                    help=f"ns-3 traffic model (default {CFG['trafficModel'][0]})")
+    ap.add_argument("--minSpeed", type=float, default=None,
+                    help="UE min speed in m/s (default: ns-3's own)")
+    ap.add_argument("--maxSpeed", type=float, default=None,
+                    help="UE max speed in m/s (default: ns-3's own)")
+    ap.add_argument("--handoverMode", choices=["NoAuto", "FixedTtt", "DynamicTtt", "Threshold"],
+                    default=None, help=f"handover algorithm (default {CFG['handoverMode'][0]})")
     args = ap.parse_args()
 
     CFG["RngRun"] = [args.seed]
+    if args.trafficModel is not None:
+        CFG["trafficModel"] = [args.trafficModel]
+    if args.minSpeed is not None:
+        CFG["minSpeed"] = [args.minSpeed]
+    if args.maxSpeed is not None:
+        CFG["maxSpeed"] = [args.maxSpeed]
+    if args.handoverMode is not None:
+        CFG["handoverMode"] = [args.handoverMode]
     action = [args.bias if c == args.cell else 0.0 for c in CELLS]
     print(f"CIO action vector (cells 2-8): {action}")
 
