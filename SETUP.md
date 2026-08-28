@@ -25,10 +25,10 @@ a local checkout you already have that half of step 2 done. Step 2 still lists
 both clones, so the sequence works whether you got here by cloning the gym
 repository or by reading this on the web.
 
-Before you start, check the commit hashes in step 2 are current. This guide pins
-exact commits so a setup is reproducible, and those hashes have to be updated
-whenever new work is pushed. If a step below refers to a file your clone does not
-have, that is the first thing to check.
+The commit hashes in step 2 pin the current pushed state of both repositories,
+so a setup from this guide is reproducible. If a step below refers to a file your
+clone does not have, confirm you checked out the commits in step 2 rather than
+the default branch.
 
 ---
 
@@ -60,10 +60,10 @@ scripts expect, so use them unless you have a reason not to.
 mkdir -p ~/oran-project && cd ~/oran-project
 
 git clone https://github.com/Raadelasmar/ns-o-ran-ns3-mmwave.git ns-3-mmwave-oran
-git -C ns-3-mmwave-oran checkout 0559c62a5ac0a8791ec9febbc39679bad2ffbd6b
+git -C ns-3-mmwave-oran checkout 21e1b37086d72d289041b0968576d3dd18f292d3
 
 git clone https://github.com/Raadelasmar/ns-o-ran-gym.git ns-o-ran-gym
-git -C ns-o-ran-gym checkout 1ef0b7dce0d45433f762124425299dfbaa5b4425
+git -C ns-o-ran-gym checkout 96967fcedf3bc7ae97629f739584bff20340e68f
 ```
 
 ---
