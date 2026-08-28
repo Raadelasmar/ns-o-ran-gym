@@ -73,10 +73,11 @@ git -C ns-o-ran-gym checkout 96967fcedf3bc7ae97629f739584bff20340e68f
 The simulator needs a module called `oran-interface`, which lives in its own
 upstream repository and belongs at `ns-3-mmwave-oran/contrib/oran-interface`.
 
-There is a catch. The ns-3 fork you just cloned already tracks one file inside
-that directory (`model/zmq-database-client.h`, the ZeroMQ bridge header), so the
-directory already exists and is not empty. A plain `git clone` into it fails with
-`destination path already exists and is not an empty directory`.
+There is a catch. The ns-3 fork you just cloned already tracks two files inside
+that directory (`CMakeLists.txt` and `model/zmq-database-client.h`, the ZeroMQ
+bridge header), so the directory already exists and is not empty. A plain
+`git clone` into it fails with `destination path already exists and is not an
+empty directory`.
 
 Clone it somewhere else and move the contents in:
 
@@ -102,14 +103,18 @@ covers.
 
 ---
 
-## 4. Apply the build fix to the oran-interface CMakeLists
+## 4. The oran-interface build fix (already applied)
+
+No action needed here. This step is background for a fix that is already in
+place, so read it or skip it.
 
 The upstream `oran-interface` build file knows nothing about ZeroMQ, so out of
-the box the build fails twice. Both failures are real and both are fixed by the
-same small edit, which is tracked in the ns-3 fork but excluded from `contrib/`
-by a gitignore rule, so it needs to be copied in by hand.
+the box the build fails twice. The ns-3 fork tracks its own fixed
+`contrib/oran-interface/CMakeLists.txt`, which is why step 3 copies the upstream
+module in with `--update=none`: the flag preserves the fixed file instead of
+overwriting it with the upstream one.
 
-The two failures, so you know what you are avoiding:
+The two failures it prevents, so you know what the fix is for:
 
 1. Without `model/zmq-database-client.h` in the module's `HEADER_FILES` list,
    ns-3 never copies it into `build/include/ns3/`, and compiling the scenario
@@ -119,11 +124,11 @@ The two failures, so you know what you are avoiding:
    header-only wrapper over libzmq's C API, so the library still has to be
    linked.
 
-Open `ns-3-mmwave-oran/contrib/oran-interface/CMakeLists.txt` and make two
-changes.
+The fix is two additions to
+`ns-3-mmwave-oran/contrib/oran-interface/CMakeLists.txt`, both already present at
+the pinned commit.
 
-First, immediately after the `message(STATUS "libraries found: ...")` line near
-the top, add:
+First, after the `message(STATUS "libraries found: ...")` line near the top:
 
 ```cmake
 # ZeroMQ (libzmq + cppzmq header) is required by model/zmq-database-client.h
@@ -140,8 +145,8 @@ endif()
 include_directories(${zmq_INCLUDE_DIRS})
 ```
 
-Second, inside the `build_lib(...)` block at the bottom, add one line to the end
-of `HEADER_FILES` and one to the end of `LIBRARIES_TO_LINK`:
+Second, inside the `build_lib(...)` block at the bottom, one line at the end of
+`HEADER_FILES` and one at the end of `LIBRARIES_TO_LINK`:
 
 ```cmake
     HEADER_FILES ...
@@ -153,8 +158,15 @@ of `HEADER_FILES` and one to the end of `LIBRARIES_TO_LINK`:
                     ${zmq_LIBRARIES}
 ```
 
-If you are working from a checkout that already has this change, note that
-`contrib/` is gitignored, so committing it needs a force add:
+To confirm your clone has it:
+
+```bash
+grep -c zmq ~/oran-project/ns-3-mmwave-oran/contrib/oran-interface/CMakeLists.txt
+```
+
+Any count greater than 0 means the fix is in place; an unfixed upstream copy
+returns 0. If you ever edit this file, note that `contrib/` is gitignored, so
+committing it needs a force add:
 
 ```bash
 git -C ~/oran-project/ns-3-mmwave-oran add --force contrib/oran-interface/CMakeLists.txt
@@ -195,18 +207,24 @@ dpkg -l | grep e2sim        # expect: ii  e2sim-dev  1.0.0  amd64
 
 ```bash
 cd ~/oran-project/ns-3-mmwave-oran
-./ns3 configure -d optimized
+./ns3 configure -d optimized -- -DNS3_EMU=OFF -DNS3_TAP=OFF
 ./ns3 build
 ./ns3 show profile          # expect: Build profile: optimized
 ```
 
-Two things worth knowing:
+The `-DNS3_EMU=OFF -DNS3_TAP=OFF` is required on a fresh clone: configuring
+against a new CMake cache hits a dependency ordering problem in `fd-net-device`
+(`The dependency target "raw-sock-creator" ... does not exist`) that an existing
+cache masks, and neither emu nor tap is used by this project.
+
+Three things worth knowing:
 
 - `-d optimized` sets the build profile but leaves the output in the default
-  `build/` directory. It does not create `build/optimized/`. This is why every
-  driver script in `ns-o-ran-gym/examples/` passes `optimized=False`: that flag
+  `build/` directory. It does not create `build/optimized/`. This is why both MLB
+  driver scripts in `ns-o-ran-gym/examples/` pass `optimized=False`: that flag
   only selects which path goes on `LD_LIBRARY_PATH`, and `optimized=False` with a
-  `-d optimized` build is the correct combination.
+  `-d optimized` build is the correct combination. (`energy_saving.py` exposes it
+  as an `--optimized` command-line flag instead.)
 - Skipping the `-d optimized` step gives you a debug build, which is roughly
   2.8 times slower. Over a multi-day training run that matters.
 
@@ -245,7 +263,11 @@ pip install -e ~/oran-project/ns-o-ran-gym
 ```
 
 The last line installs the gym repository in editable mode, which is what makes
-`import nsoran` and `import ns_o_ran_gym.bridge...` resolve to your working copy.
+`import ns_o_ran_gym...` resolve to your working copy. The environment and
+training modules under `src/` are not part of that package and do not need to be:
+every script that uses them puts `src/` on `sys.path` itself, so
+`from environments.mlb_zmq_env import ...` and the `nsoran.*` imports inside it
+resolve with no extra installation step.
 
 You must activate this venv in every shell you use for this project:
 
@@ -285,7 +307,7 @@ cd ~/oran-project/ns-o-ran-gym
 python3 examples/train_mlb_smoke.py
 ```
 
-It prints `SMOKE TEST PASSED` on success and exits non-zero on failure.
+It prints `SMOKE TEST PASSED ✅` on success and exits non-zero on failure.
 
 **It takes about 23 minutes and looks frozen for most of that. Do not kill it.**
 Measured end to end on a 12 logical / 6 physical core machine: 1353 seconds, with
@@ -310,7 +332,7 @@ line:
 |    total_timesteps | 16   |
 | train/             |      |
 |    n_updates       | 10   |
-SMOKE TEST PASSED
+SMOKE TEST PASSED ✅
 ```
 
 The `n_updates` figure is the thing to look for: it confirms PPO actually
@@ -410,13 +432,14 @@ Red flags:
 
 ## Gotchas that will cost you time
 
-**The editable install overrides `sys.path`.** The project is installed with
-`pip install -e`, which sets up a finder hook that hardcodes the real `src` path.
-Any `sys.path.insert` you write to point at a modified copy of the environment is
-ignored, and Python silently imports the original and reports a passing test. If
-you want to test a modified copy, edit the real file or uninstall the editable
-package first. This one is genuinely hard to spot because nothing fails: you just
-get a green result for code you never ran.
+**An editable install can override `sys.path`.** `pip install -e` sets up a
+finder hook that hardcodes real paths for the package it installs. If a package
+covering the module you are editing is installed that way, any `sys.path.insert`
+you write to point at a modified copy is ignored, Python silently imports the
+original, and the test passes on code you never ran. Step 7 installs only
+`ns_o_ran_gym`, so the modules under `src/` are not affected on a clean setup;
+this is worth knowing if you add editable installs of your own. Check with
+`pip list | grep -i -e nsoran -e ns-o-ran` if a test result looks impossible.
 
 **Three simulator flags must stay at their defaults.** Each looks like a free
 speed or disk saving and each silently destroys the KPIs instead of raising an

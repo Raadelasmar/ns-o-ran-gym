@@ -1,5 +1,14 @@
 # NsOranEnv
 
+> **Note on `MlbZmqEnv`.** This document describes `NsOranEnv`'s standard pipeline:
+> semaphores for synchronisation, an `ActionController` writing actions to a shared
+> file, and a `Datalake` filled from the CSV traces ns-3 writes. The Mobility Load
+> Balancing environment added by this fork (`src/environments/mlb_zmq_env.py`) is a
+> `NsOranEnv` subclass but bypasses that path: it exchanges KPIs and CIO offsets with
+> ns-3 directly over a ZeroMQ socket, so the `ActionController`, the semaphores and the
+> SQLite datalake described below are not used on that route. See
+> [CONTRIBUTIONS.md](../CONTRIBUTIONS.md) and [mlb_training_fixes.md](mlb_training_fixes.md).
+
 The `NsOranEnv` class is an abstract base class for creating environments compliant with the Gymnasium framework, specifically designed for ns-O-RAN simulations. This class provides a structured way to initialize, configure, and manage simulations using the ns-3 network simulator, facilitating the integration of reinforcement learning algorithms with network simulations.
 
 ### Initialization

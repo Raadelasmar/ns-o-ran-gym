@@ -3,14 +3,37 @@
 > Part of the BME / Nokia Bell Labs project **"Hybrid SON and Multi-Agent AI for Autonomous
 > Optimization of Future Mobile Networks."**
 >
-> This fork adds, on top of the upstream environment:
+> ### Setting up
+>
+> **Start at [SETUP.md](SETUP.md).** It is the setup path for this project: a
+> step-by-step guide from a clean Ubuntu 24.04 machine to a running MLB training
+> pipeline, with both repositories pinned to exact commits. The upstream
+> installation instructions further down this file do not apply to this fork.
+>
+> ### What this fork adds
+>
+> On top of the upstream environment:
+> - **`MlbZmqEnv`** (`src/environments/mlb_zmq_env.py`), a Mobility Load Balancing
+>   environment that sets a per-cell CIO offset on a 7-cell mmWave network, driven
+>   over a direct **ZeroMQ bridge** to ns-3 rather than the semaphore + CSV datalake
+>   path the other environments use
+> - the **MLB reward function** and its observation layout, with the reasoning for
+>   each term written next to it in `src/environments/mlb_zmq_env.py`
+> - a **PPO training pipeline** (`examples/train_mlb_smoke.py` for a 16-timestep
+>   end-to-end check, `examples/train_mlb_parallel.py` for multi-simulator runs)
+>   and per-run analysis in `analysis/analyse_run.py`
+> - **reward validation work**: `analysis/mlb_reward.py`, `analysis/mlb_observation.py`,
+>   `analysis/EXPERIMENT_RESULTS.md` and `analysis/PHASE1_FINDINGS.md`
 > - a compound cell-load metric and its validation tooling (`analysis/`)
-> - CIO experiment drivers (`examples/cio_experiment.py`, `examples/cio_headroom.py`)
+> - CIO experiment drivers (`examples/cio_experiment.py`, `examples/cio_zmq_experiment.py`,
+>   `examples/cio_headroom.py`)
 > - a before/after run comparison tool (`compare_runs.py`)
 > - fixes to the datalake ingestion and episode-boundary handling (`src/nsoran/`)
 >
 > See **[CONTRIBUTIONS.md](CONTRIBUTIONS.md)** for exactly what was created and modified,
-> with line counts derived from git.
+> with line counts derived from git, and **[docs/mlb_training_fixes.md](docs/mlb_training_fixes.md)**
+> for what has been fixed in the training pipeline and why, the pilot post-mortem, and
+> the PPO versus SAC comparison with measured sample budgets.
 >
 > **Companion repository (required):**
 > [Raadelasmar/ns-o-ran-ns3-mmwave](https://github.com/Raadelasmar/ns-o-ran-ns3-mmwave) —
@@ -25,25 +48,21 @@ This repository contains a package for a [gymnasium](https://gymnasium.farama.or
 
 ## Installation
 
-Clone the repository
+See **[SETUP.md](SETUP.md)** — it covers both repositories, the e2sim dependency, the
+ns-3 build and the Python environment, and is the only install path this fork keeps
+current.
 
-```
-hatch build
-pip3 install dist/*.tar.gz
-```
-
-A published version of the package is available:
-
-```
-pip3 install nsoran
-```
+> The upstream instructions that used to be here (`hatch build`, `pip3 install nsoran`)
+> do not work for this fork: the build backend is setuptools, not hatch, and the
+> package this repository declares is `ns_o_ran_gym` — `nsoran` on PyPI is an unrelated
+> project.
 
 ## An overview
 
 At a high level: the system can be viewed through its different parts:
 
-+ The `base` folder contains the abstract class `NsOranEnv`, as well as the two utility classes: `ActionController` and `Datalake`. `NsOranEnv` deals with the communication with the agent and the underlying simulation, `ActionController` writes the agent's action to a file shared with the simulation and `Datalake` acts as a wrapper to an *SQLite* database used to store the *KPMs* (*Key Performance Metrics*).
-+ The `environments` folder contains `TrafficSteeringEnv` and `EnergySavingEnv`, environments derived from `NsOranEnv`, implementing the Traffic Steering and Energy Saving use case
++ The `src/nsoran/` folder (`base` upstream) contains the abstract class `NsOranEnv`, as well as the two utility classes: `ActionController` and `Datalake`. `NsOranEnv` deals with the communication with the agent and the underlying simulation, `ActionController` writes the agent's action to a file shared with the simulation and `Datalake` acts as a wrapper to an *SQLite* database used to store the *KPMs* (*Key Performance Metrics*).
++ The `src/environments/` folder contains `TrafficSteeringEnv`, `EnergySavingEnv` and `MlbZmqEnv`, environments derived from `NsOranEnv`, implementing the Traffic Steering, Energy Saving and Mobility Load Balancing use cases. `MlbZmqEnv` is this fork's addition and takes the ZeroMQ path described above rather than the `ActionController` + `Datalake` pipeline
 
 The primary goal of this work is to provide a Gymnasium-compliant environment for 5G Open RAN online reinforcement learning. To accommodate a wide range of use cases, we have developed `NsOranEnv`, an abstract environment that serves as the foundational building block for all new environments. `NsOranEnv` coordinates both the environment and the ns-3 simulation, offering several utilities as well. This structure simplifies the creation and testing of new environments, as the complexities of ns-3 and its simulations are managed by the existing `NsOranEnv`.
 
