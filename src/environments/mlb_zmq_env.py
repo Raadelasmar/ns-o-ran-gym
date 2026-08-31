@@ -108,6 +108,22 @@ BALANCE_GUARD_VALUE = 1.0
 # with the CFG's indicationPeriodicity if that ever changes.
 KPI_WINDOW_S = 0.1
 
+# Which formula produced a given reward, stamped into every diagnostics block.
+#
+# WHY THIS EXISTS (Step 10i). FIX 13 changed Backlog's denominator from the E2
+# volume over KPI_WINDOW_S to the PDCP drain over the REPORTED window. It landed
+# midway through a recording session, so analysis/mlb_session_2026-08-16 holds
+# arms on BOTH formulas: am_neutral and am_flipflop are pre-FIX-13, am_balance2
+# and am_balance3 are post. Nothing in a recorded run said so. Comparing the raw
+# `backlog` field across that boundary makes a pure formula change look like a
+# 37% physical effect, which is exactly the false T_control finding Step 10h-9
+# reported and Step 10i retracted.
+#
+# Bump this whenever a term's FORMULA changes -- not when a weight is retuned,
+# which is already recorded per-run under "weights". A run that carries no
+# version key at all predates the stamp and is pre-FIX-13 by construction.
+REWARD_FORMULA_VERSION = 13
+
 # Full-buffer UDP DL UEs are node index u % 4 == 0 in scenario-marl-zmq.cc's
 # trafficModel=3 (UdpClient, 1280 B payload every 500 us), and IMSI = u + 1,
 # hence the (imsi - 1) % 4 == 0 rule.
@@ -132,6 +148,33 @@ KPI_WINDOW_S = 0.1
 # The term is not dead: it flags 28.9% of legs and carries 19% of reward SD. It
 # is simply not calibrated to anything. Treat the value as a pending decision.
 PINGPONG_Y_S = 0.8
+
+# Reference window for the PingPong term, in seconds.
+#
+# PingPong is the ONLY one of the five reward terms whose magnitude depends on
+# T_control. The other four are levels or ratios -- Balance is a Jain index,
+# Satisfaction is kbps/kbps, BadSignal is a bin fraction, Backlog is seconds of
+# drain time -- and none of them move if the control period changes. PingPong
+# was `pingpong_count / active_ues`, a COUNT PER STEP, so halving T_control
+# halves it while the other four stay put.
+#
+# That is not a scaling nuisance, it is a ranking bug. Replaying the Step 6o
+# discrimination arms with PingPong scaled to a 0.1 s step REVERSES the
+# neutral-vs-flipflop ordering (gap +0.2213 -> -0.0242): the flip-flop
+# controller is actually BETTER than do-nothing on satisfaction (0.4511 vs
+# 0.4337) and backlog (2.6696 vs 3.1789, lower is better), and the ONLY thing
+# that correctly ranks it worst is the ping-pong bill. Deflate that bill and the
+# validated PASS inverts.
+#
+# So the term is expressed as ping-pongs per UE per PINGPONG_REF_S seconds,
+# dividing by the handover_window_s ns-3 reports for the batch it just drained.
+# REF is 1.0 s because every tuned weight, every recorded arm and the entire
+# Step 6o validation were measured at T_control = 1.0: at that period the factor
+# is PINGPONG_REF_S / handover_window_s = 1.0 / 1.0 = exactly 1.0, an IEEE-754
+# exact multiply, so w_pingpong = 1.5 and the PASS carry over unchanged. Do not
+# "tidy" this to 0.1 to match KPI_WINDOW_S -- that would silently rescale the
+# term 10x and invalidate every recorded reward.
+PINGPONG_REF_S = 1.0
 
 # PDCP SDU size of one full-buffer UDP packet: 1280 B payload plus 30 B of
 # UDP/IP headers. DlE2PdcpStats.txt reports PduSize 1310 for these flows.
@@ -809,6 +852,11 @@ class MlbZmqEnv(NsOranEnv):
         if pingpong_unavailable:
             pingpong = None
             pingpong_count = 0
+            # Bound on both branches: the diagnostics block below reads these
+            # unconditionally, and a term that is merely UNAVAILABLE must not
+            # raise NameError on the way out.
+            pingpong_window_s = PINGPONG_REF_S
+            pingpong_rate_scale = 1.0
         else:
             self._handover_history.extend(handovers_this_step)
             if self._handover_history:
@@ -825,7 +873,24 @@ class MlbZmqEnv(NsOranEnv):
                     if t - tp <= PINGPONG_Y_S and sp == dst and dp == src:
                         pingpong_count += 1
                         break
-            pingpong = (pingpong_count / active_ues) if active_ues > 0 else 0.0
+            # Per UE per PINGPONG_REF_S seconds, not per step. See
+            # PINGPONG_REF_S for why a per-step count is a ranking bug rather
+            # than a scaling nuisance.
+            #
+            # handover_window_s is what ns-3 actually drained (set to
+            # stepInterval in scenario-marl-zmq.cc's MarlControlStep), so the
+            # window is REPORTED, never inferred. An ns-3 build that predates
+            # the field, or a non-positive value, falls back to REF, which makes
+            # the factor exactly 1.0 and reproduces the old behaviour rather
+            # than dividing by zero. It must NOT fall back to control_period_s:
+            # that is the 0.1 s E2 KPI window, a different quantity, and using
+            # it here would inflate the term 10x. See KPI_WINDOW_S.
+            pingpong_window_s = float((kpis or {}).get("handover_window_s") or 0.0)
+            if pingpong_window_s <= 0.0:
+                pingpong_window_s = PINGPONG_REF_S
+            pingpong_rate_scale = PINGPONG_REF_S / pingpong_window_s
+            pingpong = ((pingpong_count / active_ues) * pingpong_rate_scale
+                        if active_ues > 0 else 0.0)
 
         reward = (self.w_balance * balance
                   - self.w_backlog * backlog
@@ -858,6 +923,9 @@ class MlbZmqEnv(NsOranEnv):
                 "balance_guarded": bool(balance_guarded),
                 "backlog_denominator_zero": bool(backlog_denominator_zero),
                 "backlog_rate_source": backlog_rate_source,
+                # Stamped so a recorded run declares which formula produced it.
+                # See REWARD_FORMULA_VERSION: an absent key means pre-FIX-13.
+                "reward_formula_version": REWARD_FORMULA_VERSION,
                 "badsignal_bad_count": badsignal_bad,
                 "badsignal_total_tx": badsignal_total_tx,
                 "badsignal_denominator_zero": bool(badsignal_denominator_zero),
@@ -874,6 +942,9 @@ class MlbZmqEnv(NsOranEnv):
                 "low_load_prb_threshold": self.low_load_prb_threshold,
                 "pingpong_unavailable": bool(pingpong_unavailable),
                 "pingpong_count": pingpong_count,
+                "pingpong_window_s": pingpong_window_s,
+                "pingpong_rate_scale": pingpong_rate_scale,
+                "pingpong_ref_s": PINGPONG_REF_S,
                 "handovers_this_step": n_handovers,
                 "handover_history_len": len(self._handover_history),
                 "pingpong_y_s": PINGPONG_Y_S,

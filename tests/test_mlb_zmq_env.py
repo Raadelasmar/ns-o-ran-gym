@@ -20,8 +20,8 @@ from gymnasium.utils.env_checker import check_env
 
 sys.path.insert(0, path.join(path.dirname(__file__), "..", "src"))
 from environments.mlb_zmq_env import (BUFFER_SCALE_BYTES, CELLS, CIO_LIMIT_DB, KPI_WINDOW_S,
-                                      OBS_FIELDS, SINR_FLOOR_DB, SINR_SCALE_DB,
-                                      VOLUME_SCALE_BYTES, MlbZmqEnv, obs_index)
+                                      OBS_FIELDS, REWARD_FORMULA_VERSION, SINR_FLOOR_DB,
+                                      SINR_SCALE_DB, VOLUME_SCALE_BYTES, MlbZmqEnv, obs_index)
 
 CFG = {"ues": [3], "simTime": [10], "RngRun": [555]}
 
@@ -450,6 +450,188 @@ def test_pingpong_detection():
     assert t["pingpong"] is None
     assert t["diagnostics"]["pingpong_unavailable"] is True
     assert "pingpong" not in t["diagnostics"]["terms_present"]
+    env.close()
+
+
+def test_backlog_is_a_level_not_a_rate():
+    """Backlog must be INVARIANT to the reported window -- the exact opposite of
+    PingPong, and for the same reason.
+
+    Backlog is seconds of drain time: a queued LEVEL divided by a delivery RATE.
+    Report the same physical flow over a 10x shorter window and both the bytes
+    and the window shrink 10x, so the rate -- and therefore the term -- must not
+    move at all. PingPong, a count per step, must scale 10x. Those two tests are
+    a matched pair and neither is meaningful without the other.
+
+    WHY THIS EXISTS (Step 10i). Step 10h-9 reported Backlog as +32.6%
+    T_control-dependent on an arm whose physics was bit-identical at both
+    control periods. It was not: `am_neutral` was recorded BEFORE FIX 13 (E2
+    volume / KPI_WINDOW_S) and the T=0.1 arm after it (PDCP / reported window),
+    so a pure formula change was read as a physical effect. With one formula on
+    both sides the same arm comes out at +0.20%. The term was correct all along;
+    the COMPARISON was not. This test pins the property so the question never
+    has to be re-litigated from run artefacts again.
+    """
+    env = make_env()
+    env.reset(seed=0)
+
+    # One physical flow, reported two ways. Same queue, same bytes-per-second,
+    # only the accounting window differs.
+    BUFFER_BYTES = 4_000_000.0
+    RATE_BPS = 10_000_000.0
+
+    def terms(window_s):
+        snap = _snapshot(1)
+        for i, (cell, ck) in enumerate(snap["cells"].items()):
+            # All the queue on one cell; Backlog sums over cells anyway.
+            ck["buffer_bytes"] = BUFFER_BYTES if i == 0 else 0.0
+            ck["pdcp_delivered_bytes"] = ({"1": RATE_BPS * window_s}
+                                          if i == 0 else {})
+            ck["pdcp_window_s"] = window_s
+        return env._reward_terms(snap)
+
+    ref = terms(1.0)          # the T_control = 1.0 reference
+    short = terms(0.1)        # the same flow over a 10x shorter window
+
+    d_ref, d_short = ref["diagnostics"], short["diagnostics"]
+
+    # NON-VACUITY. A zero term satisfies any invariance claim, and a term that
+    # fell back to the E2-volume branch would not be testing FIX 13 at all.
+    assert ref["backlog"] > 0.0, ref["backlog"]
+    assert d_ref["backlog_rate_source"] == "pdcp", d_ref["backlog_rate_source"]
+    assert d_short["backlog_rate_source"] == "pdcp", d_short["backlog_rate_source"]
+    assert d_ref["pdcp_window_s"] == 1.0 and d_short["pdcp_window_s"] == 0.1
+
+    # The queued LEVEL is the same physical queue in both.
+    assert d_ref["backlog_bytes"] == d_short["backlog_bytes"] == BUFFER_BYTES
+
+    # The property under test, EXACTLY. bytes/window is (r*w)/w, which for
+    # IEEE-754 returns r exactly for these values, so this is not an
+    # approximate claim.
+    assert short["backlog"] == ref["backlog"], (
+        "Backlog is not window-invariant: the same flow reported over a 10x "
+        "shorter window changed the drain time",
+        ref["backlog"], short["backlog"])
+
+    # And it is the drain time it claims to be: level / rate, in seconds.
+    assert abs(ref["backlog"] - BUFFER_BYTES / RATE_BPS) < 1e-12, ref["backlog"]
+    assert d_ref["delivery_rate_bytes_per_s"] == d_short["delivery_rate_bytes_per_s"]
+
+    # The reward must carry the same invariance, weight included.
+    assert abs((ref["reward"] - short["reward"])) < 1e-12, (
+        ref["reward"], short["reward"])
+
+    # The stamp that makes a cross-formula comparison self-detecting.
+    assert d_ref["reward_formula_version"] == REWARD_FORMULA_VERSION
+    assert REWARD_FORMULA_VERSION >= 13
+
+
+def test_backlog_and_pingpong_are_a_matched_pair():
+    """The two window behaviours in one place: one scales, the other must not.
+
+    Guards against a future edit 'fixing' the wrong one -- normalising Backlog
+    by the window (it already is) or de-normalising PingPong.
+    """
+    env = make_env()
+    env.reset(seed=0)
+
+    def terms(window_s):
+        snap = _snapshot(1)
+        snap["timestamp"] = 2.0
+        snap["handover_window_s"] = window_s
+        snap["handovers"] = [{"t": 1.92, "imsi": 7, "src": 2, "dst": 3},
+                             {"t": 1.98, "imsi": 7, "src": 3, "dst": 2}]
+        for i, (cell, ck) in enumerate(snap["cells"].items()):
+            ck["buffer_bytes"] = 4_000_000.0 if i == 0 else 0.0
+            ck["pdcp_delivered_bytes"] = ({"1": 1e7 * window_s} if i == 0 else {})
+            ck["pdcp_window_s"] = window_s
+        env._handover_history = []
+        return env._reward_terms(snap)
+
+    ref, short = terms(1.0), terms(0.1)
+    assert ref["diagnostics"]["pingpong_count"] == 1, "vacuous: no ping-pong detected"
+    assert ref["backlog"] > 0.0 and ref["pingpong"] > 0.0
+
+    # A LEVEL: unchanged.  A RATE: exactly 10x.
+    assert short["backlog"] == ref["backlog"], ("Backlog moved with the window",
+                                                ref["backlog"], short["backlog"])
+    assert short["pingpong"] == 10.0 * ref["pingpong"], ("PingPong did not scale",
+                                                         ref["pingpong"], short["pingpong"])
+
+
+def test_pingpong_is_a_rate_not_a_per_step_count():
+    """PingPong must scale with handover_window_s, not with the step count.
+
+    PingPong is the ONLY one of the five reward terms whose magnitude depends on
+    T_control: the other four are levels or ratios (Jain index, kbps/kbps, a bin
+    fraction, seconds of drain time). While it was `pingpong_count/active_ues`,
+    a COUNT PER STEP, shortening the control period deflated it while the other
+    four stayed put -- which REVERSES the recorded neutral-vs-flipflop ordering
+    of the Step 6o validation (reward gap +0.2213 -> -0.0242), scoring the
+    flip-flop controller better than do-nothing. See PINGPONG_REF_S.
+
+    So this asserts the property, not the implementation: the SAME ping-pong
+    count reported over a 10x shorter window must yield EXACTLY 10x the term.
+    Exact equality is deliberate -- at window == PINGPONG_REF_S the factor is
+    1.0/1.0, an IEEE-754 exact multiply, which is what lets every weight tuned
+    at T_control = 1.0 and the whole Step 6o PASS carry over unchanged.
+    """
+    env = make_env()
+    env.reset(seed=0)
+
+    # UE 7 goes 2->3 then 3->2, 60 ms apart: one ping-pong (gap < Y = 0.8 s),
+    # and close enough together to sit inside a 0.1 s window as well as a 1.0 s
+    # one, so the DETECTED COUNT is held fixed and only the reported window
+    # varies. That isolates the normalisation from the detector.
+    HANDOVERS = [{"t": 1.92, "imsi": 7, "src": 2, "dst": 3},
+                 {"t": 1.98, "imsi": 7, "src": 3, "dst": 2}]
+
+    def terms(window_s):
+        snap = _snapshot(1)
+        snap["timestamp"] = 2.0
+        snap["handovers"] = [dict(h) for h in HANDOVERS]
+        if window_s is not None:
+            snap["handover_window_s"] = window_s
+        env._handover_history = []          # identical detector state each call
+        return env._reward_terms(snap)
+
+    ref = terms(1.0)
+    short = terms(0.1)
+    d_ref, d_short = ref["diagnostics"], short["diagnostics"]
+
+    # Non-vacuity: a zero term would satisfy any ratio. Guard it explicitly.
+    assert d_ref["pingpong_count"] == 1, d_ref
+    assert ref["pingpong"] > 0.0, ref["pingpong"]
+
+    # The count must be IDENTICAL, so the 10x below comes from the window and
+    # not from the detector seeing something different.
+    assert d_short["pingpong_count"] == d_ref["pingpong_count"], (d_ref, d_short)
+
+    # The property under test, exactly.
+    assert short["pingpong"] == 10.0 * ref["pingpong"], (
+        "PingPong is not rate-normalised: a 10x shorter window must give a 10x "
+        "larger term", ref["pingpong"], short["pingpong"])
+    assert d_ref["pingpong_rate_scale"] == 1.0
+    assert d_short["pingpong_rate_scale"] == 10.0
+    assert d_ref["pingpong_window_s"] == 1.0
+    assert d_short["pingpong_window_s"] == 0.1
+
+    # At the reference window the term is bit-identical to the old raw count
+    # form. This is the anchor that keeps the tuned weights valid.
+    assert ref["pingpong"] == d_ref["pingpong_count"] / d_ref["active_ues"]
+    assert d_ref["pingpong_ref_s"] == 1.0
+
+    # Both fallbacks must reproduce the reference EXACTLY rather than dividing
+    # by zero or reaching for control_period_s (the 0.1 s E2 KPI window, a
+    # different quantity, which would inflate the term 10x). See KPI_WINDOW_S.
+    for label, w in (("field absent", None), ("non-positive", 0.0)):
+        fb = terms(w)
+        assert fb["pingpong"] == ref["pingpong"], (label, fb["pingpong"])
+        assert fb["diagnostics"]["pingpong_rate_scale"] == 1.0, label
+
+    # And it must reach the reward with the configured weight.
+    assert ref["reward"] - short["reward"] == (
+        env.w_pingpong * (short["pingpong"] - ref["pingpong"]))
     env.close()
 
 
