@@ -464,11 +464,11 @@ if __name__ == "__main__":
                    "ppo_pilot_baseline": "AGENT_BUILD_LOG.md Step 11a-11c"},
                   fh, indent=2)
 
-    print("building ns-3 ONCE in the parent (workers skip it) ...", flush=True)
+    print("resolving prebuilt ns-3 binary in the parent (no rebuild) ...", flush=True)
     t0 = time.time()
     probe_env = MlbZmqEnv(ns3_path=args.ns3_path, scenario_configuration=dict(cfg),
                           output_folder=args.output_folder, optimized=False,
-                          zmq_port=args.base_port, build_ns3=True)
+                          zmq_port=args.base_port, build_ns3=False)
     print(f"  build/lookup done in {time.time()-t0:.1f}s -> {probe_env.script_executable}", flush=True)
     del probe_env
 

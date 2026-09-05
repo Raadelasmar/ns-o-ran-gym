@@ -14,6 +14,7 @@ from .datalake import SQLiteDatabaseAPI
 from importlib.machinery import SourceFileLoader
 import types
 import subprocess
+import sys
 import sem
 
 class NsOranEnv(gym.Env):
@@ -165,7 +166,7 @@ class NsOranEnv(gym.Env):
 
         # Only configure if necessary
         if not self.skip_configuration:
-            configuration_command = ['python3', build_program, 'configure',
+            configuration_command = [sys.executable, build_program, 'configure',
                                      '--enable-examples', '--disable-gtk',
                                      '--disable-werror']
 
@@ -179,7 +180,7 @@ class NsOranEnv(gym.Env):
         # Build ns-3
         # We don't care about the progress bar of the SimulationRunner, thus we use subprocess.run and wait the build to end
         j_argument = ['-j', str(os.cpu_count())] # if this makes problems just cut it
-        subprocess.run(['python3', build_program] + j_argument + ['build'],
+        subprocess.run([sys.executable, build_program] + j_argument + ['build'],
                                          cwd=self.ns3_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         
     def start_sim(self):
