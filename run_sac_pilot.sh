@@ -25,10 +25,17 @@ set -euo pipefail
 # the first gradient-update burst (~1-2 GB) and the cgroup passed MemoryHigh
 # unguarded. Hence n_envs=2 plus a wide margin, until train() gets a check inside.
 N_ENVS=${N_ENVS:-2}
-MEM_HIGH=${MEM_HIGH:-9.0G}           # soft cap: throttle + reclaim here
+# 2026-09-06/07 oomd kills: MemoryHigh does not throttle gently, it triggers
+# synchronous reclaim, and systemd-oomd scores cgroups on exactly that. Both
+# runs died at 22.5G against MemoryHigh=22G, never reaching MemoryMax=26G
+# ("killed ... due to memory pressure ... being 91.46% > 50.00% for > 20s with
+# reclaim activity", Pgscan 1.58M). So MemoryHigh is off and MemGuard's anon
+# ceiling is the soft stop, with a wide margin under MemoryMax for the train()
+# burst MemGuard cannot see. Keep ANON_CEILING_GB well below MEM_MAX.
+MEM_HIGH=${MEM_HIGH:-infinity}       # NOT a throttle: it is a reclaim storm
 MEM_MAX=${MEM_MAX:-10.5G}            # hard backstop: kill inside our cgroup only
 MEM_SWAP=${MEM_SWAP:-2G}
-ANON_CEILING_GB=${ANON_CEILING_GB:-8.5}    # MemGuard: our own anon (below MemoryHigh)
+ANON_CEILING_GB=${ANON_CEILING_GB:-8.5}    # MemGuard: our own anon (keep below MemoryMax)
 MIN_AVAIL_GB=${MIN_AVAIL_GB:-2.5}            # MemGuard: system MemAvailable
 MIN_FREE_GB=${MIN_FREE_GB:-3.0}                        # DiskGuard
 # N_ENVS and GRADIENT_STEPS are one decision: train_freq=1 makes updates/sample

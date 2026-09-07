@@ -60,6 +60,26 @@ CFG = {
     # Fix 2. Not control_period_s: that is the 0.1 s E2 indication window the
     # byte counters cover, a different quantity that shares the value.
     "controlInterval": [0.1],
+    # oomd/PSI fix (2026-09-07). The trace SINKS must stay connected:
+    # MmWavePhyTrace::UpdateTraces(), the only writer of the counters behind
+    # prb_utilization, volume_bytes and sinr_bins, is called from inside
+    # RxPacketTraceUeCallback (mmwave-phy-trace.cc:422), which only
+    # EnableDlPhyTrace() connects. enableTraces=0 would therefore zero two
+    # observation fields and the Balance/BadSignal reward terms, silently. So
+    # the flag stays on and the FILES are redirected instead: 257 of the 262 MB
+    # each episode writes, none of it read by anything.
+    # These are ns-3 default-attribute assignments, handled by the scenario's
+    # cmd.Parse (scenario-marl-zmq.cc:652), so they need no rebuild. Every
+    # target is a plain write-only std::ofstream -- no seek, no read-back --
+    # which is what makes the unseekable /dev/null safe.
+    "ns3::MmWavePhyTrace::OutputFilename": ["/dev/null"],
+    "ns3::MmWavePhyTrace::DlPhyTransmissionFilename": ["/dev/null"],
+    "ns3::MmWaveMacTrace::SchedInfoOutputFilename": ["/dev/null"],
+    "ns3::MmWaveBearerStatsConnector::MmWaveSinrOutputFilename": ["/dev/null"],
+    "ns3::CoreNetworkStatsCalculator::X2FileName": ["/dev/null"],
+    "ns3::PhyStatsCalculator::DlRsrpSinrFilename": ["/dev/null"],
+    "ns3::PhyStatsCalculator::UlInterferenceFilename": ["/dev/null"],
+    "ns3::LteRlcAm::BufferSizeFilename": ["/dev/null"],
 }
 
 # Arm C (C_sac_gs16), the only T=0.1 arm that converted samples into learning.
