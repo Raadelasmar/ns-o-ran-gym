@@ -24,6 +24,10 @@
 >   and per-run analysis in `analysis/analyse_run.py`
 > - **reward validation work**: `analysis/mlb_reward.py`, `analysis/mlb_observation.py`,
 >   `analysis/EXPERIMENT_RESULTS.md` and `analysis/PHASE1_FINDINGS.md`
+> - **`MroZmqEnv`** (`src/environments/mro_zmq_env.py`), a Mobility Robustness
+>   Optimization environment that sets a per-cell handover-margin offset on the
+>   same 7-cell topology, over the same ZeroMQ bridge -- work in progress,
+>   reward weights not yet tuned and not yet exercised by a trained policy
 > - a compound cell-load metric and its validation tooling (`analysis/`)
 > - CIO experiment drivers (`examples/cio_experiment.py`, `examples/cio_zmq_experiment.py`,
 >   `examples/cio_headroom.py`)
@@ -33,7 +37,9 @@
 > See **[CONTRIBUTIONS.md](CONTRIBUTIONS.md)** for exactly what was created and modified,
 > with line counts derived from git, and **[docs/mlb_training_fixes.md](docs/mlb_training_fixes.md)**
 > for what has been fixed in the training pipeline and why, the pilot post-mortem, and
-> the PPO versus SAC comparison with measured sample budgets.
+> the PPO versus SAC comparison with measured sample budgets. See
+> **[docs/mro_training_fixes.md](docs/mro_training_fixes.md)** for the MRO agent's own
+> build notes and open items.
 >
 > **Companion repository (required):**
 > [Raadelasmar/ns-o-ran-ns3-mmwave](https://github.com/Raadelasmar/ns-o-ran-ns3-mmwave) —
