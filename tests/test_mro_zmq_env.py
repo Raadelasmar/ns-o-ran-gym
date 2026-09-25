@@ -17,9 +17,9 @@ import numpy as np
 from gymnasium.utils.env_checker import check_env
 
 sys.path.insert(0, path.join(path.dirname(__file__), "..", "src"))
-from environments.mro_zmq_env import (CELLS, MARGIN_LIMIT_DB, OBS_FIELDS, OUTAGE_SINR_DB,
-                                      PINGPONG_Y_S, SINR_FLOOR_DB, SINR_SCALE_DB,
-                                      MroZmqEnv, obs_index)
+from environments.mro_zmq_env import (CELLS, HANDOVER_RATE_REF_S, HANDOVER_WINDOW_FLOOR_S,
+                                      MARGIN_LIMIT_DB, OBS_FIELDS, OUTAGE_SINR_DB, PINGPONG_Y_S,
+                                      SINR_FLOOR_DB, SINR_SCALE_DB, MroZmqEnv, obs_index)
 
 CFG = {"ues": [3], "simTime": [10], "RngRun": [555]}
 
@@ -321,6 +321,106 @@ def test_pingpong_detects_a_return_leg():
     _, _, _, _, info = env.step(np.zeros(len(CELLS), dtype=np.float32))  # consumes snap2
     assert info["reward_terms"]["diagnostics"]["pingpong_count"] == 1
     assert info["reward_terms"]["pingpong"] is not None and info["reward_terms"]["pingpong"] > 0.0
+    env.close()
+
+
+def test_pingpong_and_handover_rate_are_rates_not_per_step_counts():
+    """PingPong AND HandoverRate must scale with handover_window_s, not with
+    the raw event count -- the same property test c576d6c added for MLB's own
+    PingPong, extended to cover MRO's copy of it plus the new HandoverRate
+    term, which has the identical count-per-step shape and was never checked
+    for this before docs/mro_training_fixes.md flagged it.
+
+    Asserts the property, not the implementation: the SAME detected handovers
+    reported over a 10x shorter window must yield EXACTLY 10x both terms.
+    Exact equality is deliberate -- at window == HANDOVER_RATE_REF_S the
+    factor is 1.0/1.0, an IEEE-754 exact multiply, which is what lets every
+    weight measured at the reference window (docs/mro_training_fixes.md's
+    round-1 baseline) carry over unchanged.
+    """
+    env = make_env()
+    env.reset(seed=0)
+
+    # Two legs for the SAME UE, 60 ms apart -- close enough to sit inside a
+    # 0.1 s window as well as a 1.0 s one, so the DETECTED COUNT is held fixed
+    # and only the reported window varies. This isolates the normalisation
+    # from the ping-pong detector's own pairing logic, and gives
+    # HandoverRate a nonzero n_handovers=2 in the same fixture.
+    HANDOVERS = [{"t": 1.92, "imsi": 7, "src": 2, "dst": 3},
+                 {"t": 1.98, "imsi": 7, "src": 3, "dst": 2}]
+
+    def terms(window_s):
+        snap = _snapshot(1)
+        snap["timestamp"] = 2.0
+        snap["handovers"] = [dict(h) for h in HANDOVERS]
+        snap["handover_window_s"] = window_s
+        env._handover_history = []  # each call is an independent measurement
+        return env._reward_terms(snap, np.zeros(len(CELLS), dtype=np.float32))
+
+    ref = terms(HANDOVER_RATE_REF_S)
+    short = terms(HANDOVER_RATE_REF_S / 10.0)
+
+    # Non-vacuity guard: both reference terms must be genuinely nonzero, or a
+    # 10x check would pass trivially on 0.0 == 0.0.
+    assert ref["pingpong"] is not None and ref["pingpong"] > 0.0
+    assert ref["handover_rate"] is not None and ref["handover_rate"] > 0.0
+    assert ref["diagnostics"]["pingpong_count"] == 1
+    assert ref["diagnostics"]["handovers_this_step"] == 2
+
+    assert short["pingpong"] == 10.0 * ref["pingpong"]
+    assert short["handover_rate"] == 10.0 * ref["handover_rate"]
+    assert short["diagnostics"]["handover_rate_scale"] == 10.0
+    assert ref["diagnostics"]["handover_rate_scale"] == 1.0
+
+    # Fallbacks: field absent, and field <= 0.0, both reproduce the
+    # reference-window behaviour (scale == 1.0) rather than dividing by zero.
+    snap_absent = _snapshot(1)
+    snap_absent["timestamp"] = 2.0
+    del snap_absent["handovers"]
+    env._handover_history = []
+    absent = env._reward_terms(snap_absent, np.zeros(len(CELLS), dtype=np.float32))
+    assert absent["diagnostics"]["handover_rate_scale"] == 1.0
+    assert absent["pingpong"] is None and absent["handover_rate"] is None
+
+    env.close()
+
+
+def test_handover_rate_scale_is_capped_for_a_pathologically_small_window():
+    """A reported handover_window_s well below any real control period must
+    not blow PingPong/HandoverRate up unboundedly.
+
+    Prompted by the reward-weight-methodology boundedness audit (see
+    HANDOVER_WINDOW_FLOOR_S): the pre-existing guard only covered
+    handover_window_s <= 0.0 (falls back to the 1.0x reference scale), not a
+    small POSITIVE window, which is the actually dangerous case -- e.g. a
+    window of 0.001 s would have inflated both terms 1000x with no cap at
+    all. This asserts the floor, not just "some large-ish number": scale
+    must be exactly HANDOVER_RATE_REF_S / HANDOVER_WINDOW_FLOOR_S (100.0 at
+    current constants), and must NOT keep growing as the reported window
+    shrinks further below the floor.
+    """
+    env = make_env()
+    env.reset(seed=0)
+
+    def terms(window_s):
+        snap = _snapshot(1)
+        snap["timestamp"] = 2.0
+        snap["handovers"] = [{"t": 1.92, "imsi": 7, "src": 2, "dst": 3},
+                             {"t": 1.98, "imsi": 7, "src": 3, "dst": 2}]
+        snap["handover_window_s"] = window_s
+        env._handover_history = []
+        return env._reward_terms(snap, np.zeros(len(CELLS), dtype=np.float32))
+
+    at_floor = terms(HANDOVER_WINDOW_FLOOR_S)
+    below_floor = terms(HANDOVER_WINDOW_FLOOR_S / 10.0)  # e.g. a 0.001 s window
+    expected_cap = HANDOVER_RATE_REF_S / HANDOVER_WINDOW_FLOOR_S
+
+    assert at_floor["diagnostics"]["handover_rate_scale"] == expected_cap
+    # The dangerous case: reporting an even smaller window must NOT scale
+    # the term any further -- both must hit the same cap, not 10x apart.
+    assert below_floor["diagnostics"]["handover_rate_scale"] == expected_cap
+    assert below_floor["pingpong"] == at_floor["pingpong"]
+    assert below_floor["handover_rate"] == at_floor["handover_rate"]
     env.close()
 
 

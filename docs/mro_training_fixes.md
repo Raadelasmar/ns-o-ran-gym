@@ -125,21 +125,92 @@ in the meantime (`c576d6c`, `13be2a8`, `696010f`, `083550e`):
 
 ## Status / next steps
 
-- [ ] Rebase `feature/mro-agent` onto `origin/main` (pulls in the
+- [x] Rebase `feature/mro-agent` onto `origin/main` (pulls in the
       rate-normalization pattern, SAC pilot infra, the `sys.executable`
       portability fix, and the `/dev/null` trace-file redirects)
-- [ ] Fix `PingPong` / `HandoverRate` rate-normalization in `mro_zmq_env.py`,
+- [x] Fix `PingPong` / `HandoverRate` rate-normalization in `mro_zmq_env.py`,
       mirroring `c576d6c`'s `handover_window_s`-based approach exactly; add
-      the equivalent T-invariance test
-- [ ] Re-run the baseline weight measurement ONCE, at the colleague's locked
+      the equivalent T-invariance test. Both terms now share one
+      `HANDOVER_RATE_REF_S` scale factor (they count the same event type
+      over the same reported window); a `REWARD_FORMULA_VERSION` stamp was
+      added at the same time, mirroring MLB's own. At the reference window
+      (1.0 s, what every number in this document was measured at) the fix is
+      an exact no-op -- confirmed by the full suite passing unchanged
+      (12/12 MRO, 37/37 combined with MLB) -- so round 1's baseline table
+      above is NOT invalidated by this fix, only by the `ues=3` regime
+      problem below. New test
+      `test_pingpong_and_handover_rate_are_rates_not_per_step_counts`,
+      mutation-tested (confirmed it fails when the scale factor is dropped).
+- [x] Re-run the baseline weight measurement ONCE, at the colleague's locked
       SAC config (`ues=5`, `simTime=30`, `controlInterval=0.1`, RLC AM,
-      `/dev/null` trace redirects) instead of the smoke-test config -- this
-      resolves the `OutageExposure` question and gives weights for the actual
-      training regime in one pass rather than two
+      `/dev/null` trace redirects) instead of the smoke-test config. Full
+      writeup in `20260910_Dani_mro_reward_implementation.pdf` Section 4.4-5;
+      summary below. 2 of 5 seeds crashed mid-episode, cause unexplained (see
+      the crash-rate checklist item further down); pooled stats are 1,372
+      steps, not five clean equal-weight runs.
+- [x] Resolve the `OutageExposure` / `ActionSmoothness` weight edge cases with
+      a stated rule rather than case by case, per
+      `20260915_Dani_RewardWeightMethodologyReport.pdf` Section 5 ("rare
+      terms" / "silent terms") -- see the round-2 results table below and
+      `DEFAULT_W_OUTAGE`/`DEFAULT_W_SMOOTH`'s code comments in
+      `mro_zmq_env.py` for the full rationale.
+- [x] Audit every MRO reward term for boundedness (methodology report
+      Section 5.1, zero simulator cost). Found one real gap: the
+      `handover_rate_scale` factor (shared by `PingPong`/`HandoverRate`) was
+      only guarded against `handover_window_s <= 0.0`, not against a small
+      *positive* window -- an unguarded report of e.g. 0.001 s would have
+      inflated both terms 1000x. Fixed with `HANDOVER_WINDOW_FLOOR_S` (floors
+      the window at 1% of `HANDOVER_RATE_REF_S`, capping the scale factor at
+      100x); new test `test_handover_rate_scale_is_capped_for_a_pathologically_small_window`,
+      mutation-tested. The other four terms are all ratios/fractions or
+      clipped-action deltas, confirmed mathematically bounded by construction.
 - [ ] Build `train_mro_sac_pilot.py` mirroring `train_mlb_sac_pilot.py` (Arm C
       hyperparameters, `DiskGuard`/`MemGuard`, `CriticProbe`/`StepLogger`)
 - [ ] Run MRO's own SAC pilot against the same "does the critic climb" bar
+- [ ] Run the adversarial `OutageExposure` check (force congestion onto one
+      cell, mirroring how MLB's `BadSignal` numerator was proven alive)
+      before fully trusting `DEFAULT_W_OUTAGE`'s fixed guard value
+- [ ] Investigate the round-2 mid-run crash rate (2/5 seeds, unexplained) at
+      `ues=5`/`controlInterval=0.1` before trusting a large training run on
+      this config
+- [ ] Re-measure `PingPong`/`HandoverRate`/`ActionSmoothness` statistics from
+      real training rollouts once the SAC pilot has run, per the methodology
+      report's Section 5.2 ("do not trust a do-nothing-baseline weight
+      forever") -- `ActionSmoothness` especially, since its current weight is
+      a Monte Carlo estimate, not a measurement
 
-**Reward weights are NOT locked.** The table above is round 1, on a config
-already known to be wrong for at least one term. Do not train against these
-values.
+## Baseline weight measurement, round 2 -- final (the real training config)
+
+5 seeded do-nothing episodes at the locked SAC configuration (`ues=5`,
+`simTime=30`, `controlInterval=0.1`, RLC AM, `/dev/null` trace redirects),
+1,372 pooled control steps after the rate-normalization fix above:
+
+| term | n | mean | detrended sd | derived weight | **weight in code** |
+|---|---|---|---|---|---|
+| signal_quality | 1076/1372 | 0.873 | 0.273 | 1.00 (anchor) | **1.00** |
+| pingpong | 1372 | 0.119 | 0.181 | 1.51 | **1.51** |
+| handover_rate | 1372 | 0.427 | 0.343 | 0.80 | **0.80** |
+| outage | 1372 | 0.0001 | 0.0017 | 159.7 (not usable) | **1.00 (fixed guard)** |
+| smoothness | -- (silent under do-nothing) | -- | 1.06 (Monte Carlo) | ~0.26 | **0.26 (provisional)** |
+
+`OutageExposure` is confirmed alive at this config (fired on 0.01% of
+UE-steps, resolving round 1's open question), but its literal equalised
+weight (159.7) is not usable -- matching its variance to `HandoverSignalQuality`
+would make the reward swing enormously on the rare step it fires, the same
+failure shape MLB's own `BadSignal` term hit (never equalised, kept at its
+default instead). Per the methodology report's stated rule for rare terms,
+`DEFAULT_W_OUTAGE` is fixed at 1.00 -- a modest guard weight in the same range
+as the other four, not the 160x-scaled literal value -- pending the
+adversarial test above.
+
+`ActionSmoothness` cannot be measured under an all-zero baseline action by
+construction (zero delta every step), so its weight is a Monte Carlo estimate
+from an untrained-PPO-like action distribution, run through the same
+anchor-equalisation formula as the other terms. **Provisional, not a
+measurement** -- to be re-derived from real rollout logs after the SAC pilot.
+
+**Reward weights ARE now set in code** (`DEFAULT_W_*` in `mro_zmq_env.py`),
+but two of five (`outage`, `smooth`) are documented fixed/provisional values
+rather than measurements, and none of the five have been checked against a
+real training rollout yet -- see the open items above before starting a full
+training run.

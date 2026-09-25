@@ -23,6 +23,7 @@ Usage:
 """
 import argparse
 import csv
+import os
 import sys
 from os import path
 
@@ -31,14 +32,33 @@ from environments.mro_zmq_env import CELLS, MroZmqEnv
 
 import numpy as np
 
-# Same locked CFG as train_mro_smoke.py / mro_margin_experiment.py.
+# ROUND 2. Same locked config as the colleague's train_mlb_sac_pilot.py's
+# ARM_C run, NOT the smoke-test config round 1 used -- see
+# docs/mro_training_fixes.md "Two problems found before investing further
+# tuning effort". ues=5 (35 UEs, not 21) and simTime=30 (not 10) because
+# ues=3 was too light a network for OutageExposure to ever fire, mirroring
+# MLB's own documented lesson. controlInterval=0.1 (not the 1.0 default)
+# because that is the colleague's locked SAC config, and the whole point of
+# fixing PingPong/HandoverRate's rate-normalization (see mro_zmq_env.py's
+# HANDOVER_RATE_REF_S) was to make this config safe to measure in. The
+# trace-file redirects are ns-3 default-attribute overrides on existing
+# trace-source classes -- no rebuild needed, same as the colleague's own use.
 CFG = {
-    "heuristicType": [-1], "simTime": [10], "ues": [3], "RngRun": [555],
+    "heuristicType": [-1], "simTime": [30], "ues": [5], "RngRun": [555],
     "configuration": [0], "trafficModel": [3], "numberOfRaPreambles": [40],
     "bsOn": [5], "bsIdle": [0], "bsSleep": [0], "bsOff": [2],
     "reducedPmValues": [0], "outageThreshold": [-5.0],
     "handoverMode": ["DynamicTtt"], "indicationPeriodicity": [0.1],
     "e2nrEnabled": [1], "rlcAmEnabled": [1],
+    "controlInterval": [0.1],
+    "ns3::MmWavePhyTrace::OutputFilename": ["/dev/null"],
+    "ns3::MmWavePhyTrace::DlPhyTransmissionFilename": ["/dev/null"],
+    "ns3::MmWaveMacTrace::SchedInfoOutputFilename": ["/dev/null"],
+    "ns3::MmWaveBearerStatsConnector::MmWaveSinrOutputFilename": ["/dev/null"],
+    "ns3::CoreNetworkStatsCalculator::X2FileName": ["/dev/null"],
+    "ns3::PhyStatsCalculator::DlRsrpSinrFilename": ["/dev/null"],
+    "ns3::PhyStatsCalculator::UlInterferenceFilename": ["/dev/null"],
+    "ns3::LteRlcAm::BufferSizeFilename": ["/dev/null"],
 }
 
 TERMS = ("quality", "pingpong", "handover_rate", "outage")
@@ -120,7 +140,7 @@ if __name__ == "__main__":
                     help="comma-separated explicit seed list, overrides --n_seeds")
     ap.add_argument("--n_seeds", type=int, default=5)
     ap.add_argument("--seed_start", type=int, default=2001)
-    ap.add_argument("--simtime", type=int, default=10)
+    ap.add_argument("--simtime", type=int, default=30)
     ap.add_argument("--zmq_port", type=int, default=5555)
     ap.add_argument("--ns3_path", default=path.expanduser("~/oran-project/ns-3-mmwave-oran"))
     ap.add_argument("--output_folder", default=path.join(path.dirname(__file__), "..", "output"))
@@ -134,18 +154,29 @@ if __name__ == "__main__":
         seeds = list(range(args.seed_start, args.seed_start + args.n_seeds))
 
     print(f"Running {len(seeds)} do-nothing baseline seeds: {seeds}", flush=True)
+    # Written incrementally, one seed at a time, flushed and fsync'd after
+    # each -- a run that gets interrupted (Ctrl-C, machine shutdown) keeps
+    # every seed that had already finished. This USED to hold everything in
+    # memory and write once at the very end: a real interruption (this
+    # happened) lost every completed seed's ~hour of real ns-3 time because
+    # nothing had touched disk yet. Real ns-3 time is too expensive to gamble
+    # on the process surviving to the last line.
     all_rows = []
-    for seed in seeds:
-        all_rows.extend(run_seed(seed, args))
-
-    if not all_rows:
-        sys.exit("No usable rows collected -- every seed crashed or produced no steps.")
-
     with open(args.csv_out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["seed", "step", "reward"] + list(TERMS))
         writer.writeheader()
-        writer.writerows(all_rows)
-    print(f"\nWrote {len(all_rows)} rows to {args.csv_out}", flush=True)
+        f.flush()
+        for seed in seeds:
+            rows = run_seed(seed, args)
+            all_rows.extend(rows)
+            writer.writerows(rows)
+            f.flush()
+            os.fsync(f.fileno())
+            print(f"  seed {seed}: {len(rows)} rows written to {args.csv_out}", flush=True)
+
+    if not all_rows:
+        sys.exit("No usable rows collected -- every seed crashed or produced no steps.")
+    print(f"\nWrote {len(all_rows)} total rows to {args.csv_out}", flush=True)
 
     print("\n=== per-term statistics (pooled across seeds) ===")
     print(f"{'term':<16} {'n':>6} {'mean':>10} {'raw_sd':>10} {'detrended_sd':>13}")

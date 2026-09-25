@@ -85,17 +85,101 @@ OUTAGE_SINR_DB = -5.0
 # phenomenon.
 PINGPONG_Y_S = 0.8
 
-# Reward weights. ALL PLACEHOLDERS at 1.0 -- deliberately not tuned. MLB's own
-# weights came from measuring the *detrended* standard deviation of each term
-# across nine seeded do-nothing baseline runs; hand-picked weights were tried
-# once for MLB and rejected after one term ended up dominating 85% of the
-# reward's variance. These five must go through the same measurement once this
-# env can run against real ns-3 traffic. Do not train with these values as-is.
-DEFAULT_W_QUALITY = 1.0
-DEFAULT_W_PINGPONG = 1.0
-DEFAULT_W_CHURN = 1.0
+# Reference window, in seconds, for PingPong AND HandoverRate. Shared by both
+# rather than two separately-named constants: they count the same underlying
+# event type (handovers) over the same ns-3-reported window, and are meant to
+# mean "activity per UE per reference second" -- keeping them on one constant
+# is what stops the two from drifting out of sync if this is ever retuned.
+#
+# WHY THIS EXISTS. c576d6c (MlbZmqEnv) found that MLB's own PingPong
+# (`pingpong_count / active_ues`) is a COUNT PER CONTROL STEP in disguise, not
+# a rate: every other term there is a level or ratio (a Jain index, kbps/kbps,
+# a bin fraction, seconds of drain time) and does not move if the control
+# period changes, but a per-step count silently rescales with it. That is not
+# a scaling nuisance, it is a ranking bug -- see c576d6c's own commit message
+# for the reward-inversion example it found.
+#
+# MRO's PingPong was copied from MLB's PRE-FIX code and has the identical
+# bug. HandoverRate (`n_handovers / active_ues`, MRO-only, added after
+# c576d6c landed) is structurally the same shape and had never been checked
+# for this at all until docs/mro_training_fixes.md flagged it. Quality and
+# OutageExposure are pure ratios/fractions (good/measured, UEs-in-outage/
+# UEs-reporting) and are immune, same as MLB's non-PingPong terms.
+#
+# REF = 1.0 s because that is the control period every baseline measured in
+# docs/mro_training_fixes.md ran at. At that period the scale factor is
+# HANDOVER_RATE_REF_S / handover_window_s = 1.0 / 1.0 = exactly 1.0, an
+# IEEE-754 exact multiply, so this fix changes nothing about the round-1
+# baseline numbers already on record -- it only matters once controlInterval
+# is ever set to something other than 1.0 (e.g. the colleague's locked SAC
+# config, which runs at 0.1).
+HANDOVER_RATE_REF_S = 1.0
+
+# Floor on handover_window_s before it becomes a divisor, and the resulting
+# cap on handover_rate_scale. Found during the boundedness audit prompted by
+# 20260915_Dani_RewardWeightMethodologyReport.pdf Section 5.1: the scale
+# factor guards against handover_window_s <= 0.0 (falls back to REF) but NOT
+# against a small positive value ns-3 might report near an episode boundary
+# or a partial step -- an unguarded window of e.g. 0.001 s would inflate
+# PingPong/HandoverRate 1000x, an unbounded term neither weight nor training
+# could recover from. Floored at 1% of REF (100x cap) rather than something
+# tighter: the existing rate-invariance test
+# (test_pingpong_and_handover_rate_are_rates_not_per_step_counts) exercises a
+# genuine 10x case at HANDOVER_RATE_REF_S/10, which must keep passing
+# unchanged, so the floor sits a full decade below that.
+HANDOVER_WINDOW_FLOOR_S = HANDOVER_RATE_REF_S / 100.0
+
+# Which formula produced a given reward, stamped into every diagnostics
+# block. Bump whenever a term's FORMULA changes, not when a weight is
+# retuned (weights are already recorded per run under "weights"). Mirrors
+# MlbZmqEnv.REWARD_FORMULA_VERSION -- see c576d6c and its own Step 10i
+# postscript for why comparing a raw reward field across a formula change,
+# without this stamp, can look like a real physical effect when it is not.
+REWARD_FORMULA_VERSION = 1
+
+# Reward weights. Measured from 5 seeded do-nothing baselines at Ra'ed's
+# locked SAC config (ues=5, simTime=30, controlInterval=0.1, RLC AM),
+# 1,372 pooled control steps -- see docs/mro_training_fixes.md and
+# 20260910_Dani_mro_reward_implementation.pdf Section 5. Same method as
+# MLB's own weights: equalise each term's *detrended* standard deviation,
+# quality anchored at 1.0. Do NOT re-derive these by re-running the
+# equalisation formula blindly -- two of the five needed a documented
+# deviation from the literal measured value; see below.
+#
+# QUALITY / PINGPONG / CHURN: the literal equalised values. 1,076/1,372
+# steps had a measurable HandoverQuality; PingPong and HandoverRate used
+# 1,372/1,372 (rate-normalised via HANDOVER_RATE_REF_S, so these are
+# comparable across control periods).
+DEFAULT_W_QUALITY = 1.00
+DEFAULT_W_PINGPONG = 1.51
+DEFAULT_W_CHURN = 0.80
+
+# OUTAGE: the literal equalised value is 159.7 -- NOT usable. OutageExposure
+# fired on only 0.01% of UE-steps in round 2; matching its variance to
+# HandoverQuality's would make the reward swing enormously on the rare step
+# it fires, the exact same failure shape MLB's own BadSignal term hit (its
+# own literal equalised value needed w~30 and was deliberately never used).
+# 20260915_Dani_RewardWeightMethodologyReport.pdf's stated rule for exactly
+# this case (Section 5, "rare terms"): a fixed, modest, NON-equalised guard
+# weight instead of the literal variance-matched one. Set to 1.0, matching
+# BadSignal's own MLB precedent and sitting inside the other MRO weights'
+# natural range (0.80-1.51) rather than the 160x-scaled outlier. A dedicated
+# adversarial test (forcing congestion onto one cell, mirroring how MLB's
+# BadSignal numerator was proven alive) is recommended before trusting this
+# further -- see docs/mro_training_fixes.md next steps.
 DEFAULT_W_OUTAGE = 1.0
-DEFAULT_W_SMOOTH = 1.0
+
+# SMOOTH: ActionSmoothness has no signal under an all-zero baseline action by
+# construction (constant action -> zero delta every step), so it could not be
+# measured the same way as the other four. Estimated via a Monte Carlo
+# simulation of an untrained-PPO-like action distribution instead: sd ~ 1.06.
+# Applying the SAME anchor-equalisation formula as the other terms
+# (anchor_sd / term_sd = 0.273 / 1.06) gives ~0.26. This is a rough starting
+# point, not a measurement -- PROVISIONAL, to be re-derived from real rollout
+# logs after the first MRO training run, per the methodology report's
+# Section 5.2 recommendation (re-measure under the trained policy, not only
+# the do-nothing baseline).
+DEFAULT_W_SMOOTH = 0.26
 
 
 def obs_index(cell: int, field: str) -> int:
@@ -514,11 +598,38 @@ class MroZmqEnv(NsOranEnv):
         handovers = handovers or []
         n_handovers = len(handovers)
 
+        # Shared by HandoverRate and PingPong -- see HANDOVER_RATE_REF_S for
+        # why one scale factor, computed once, rather than two.
+        #
+        # Bound on both branches: the diagnostics block below reads these
+        # unconditionally, and a term that is merely UNAVAILABLE must not
+        # raise NameError on the way out. handover_window_s is what ns-3
+        # actually drained (handover_window_s in the payload, set to
+        # stepInterval by scenario-marl-zmq.cc's MarlControlStep), so the
+        # window is REPORTED, never inferred. Absent, or non-positive, falls
+        # back to REF, which makes the factor exactly 1.0 and reproduces the
+        # old per-step-count behaviour rather than dividing by zero.
+        if handovers_unavailable:
+            handover_window_s = HANDOVER_RATE_REF_S
+            handover_rate_scale = 1.0
+        else:
+            handover_window_s = float((kpis or {}).get("handover_window_s") or 0.0)
+            if handover_window_s <= 0.0:
+                handover_window_s = HANDOVER_RATE_REF_S
+            # Floored, not just guarded against <=0.0: see
+            # HANDOVER_WINDOW_FLOOR_S for why a small POSITIVE window is also
+            # a boundedness hazard, found by the reward-weight-methodology
+            # audit rather than by a training incident.
+            elif handover_window_s < HANDOVER_WINDOW_FLOOR_S:
+                handover_window_s = HANDOVER_WINDOW_FLOOR_S
+            handover_rate_scale = HANDOVER_RATE_REF_S / handover_window_s
+
         # --- HandoverRate ------------------------------------------------------
         if handovers_unavailable:
             handover_rate = None
         else:
-            handover_rate = (n_handovers / active_ues) if active_ues > 0 else 0.0
+            handover_rate = ((n_handovers / active_ues) * handover_rate_scale
+                             if active_ues > 0 else 0.0)
 
         # --- PingPong (identical mechanics to MlbZmqEnv._reward_terms) -------
         if handovers_unavailable:
@@ -538,7 +649,8 @@ class MroZmqEnv(NsOranEnv):
                     if t - tp <= PINGPONG_Y_S and sp == dst and dp == src:
                         pingpong_count += 1
                         break
-            pingpong = (pingpong_count / active_ues) if active_ues > 0 else 0.0
+            pingpong = ((pingpong_count / active_ues) * handover_rate_scale
+                        if active_ues > 0 else 0.0)
 
         # --- HandoverQuality ---------------------------------------------------
         # Did the destination cell's SINR actually beat the source cell's? Only
@@ -598,6 +710,10 @@ class MroZmqEnv(NsOranEnv):
                 "handovers_unavailable": bool(handovers_unavailable),
                 "handovers_this_step": n_handovers,
                 "handover_history_len": len(self._handover_history),
+                "handover_window_s": handover_window_s,
+                "handover_rate_scale": handover_rate_scale,
+                "handover_rate_ref_s": HANDOVER_RATE_REF_S,
+                "reward_formula_version": REWARD_FORMULA_VERSION,
                 "pingpong_count": pingpong_count,
                 "pingpong_y_s": PINGPONG_Y_S,
                 "quality_good": quality_good,
