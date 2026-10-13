@@ -104,6 +104,12 @@ class _StubMroZmqEnv(MroZmqEnv):
         self._handover_history = []
         self._last_ue_sinr = {}
         self._last_action = None
+        # Real start_sim() always sets this (meta.exitcode is read by
+        # step()'s truncation branch); default to a clean exit, matching
+        # what a stub-driven "the episode ran fine" test should mean. A test
+        # exercising the crash path overwrites meta.exitcode directly before
+        # its final step() call.
+        self.sim_result = {'params': {}, 'meta': {'exitcode': 0}}
 
     def _recv_next_kpis(self):
         if self._step_count >= EPISODE_STEPS:
@@ -421,6 +427,42 @@ def test_handover_rate_scale_is_capped_for_a_pathologically_small_window():
     assert below_floor["diagnostics"]["handover_rate_scale"] == expected_cap
     assert below_floor["pingpong"] == at_floor["pingpong"]
     assert below_floor["handover_rate"] == at_floor["handover_rate"]
+    env.close()
+
+
+def _drive_to_truncation(env, exit_code: int):
+    """reset() + enough step()s to reach the truncation branch, with the
+    stub's sim_result.meta.exitcode set to `exit_code` right before the
+    final step() call that triggers it.
+    """
+    env.reset(seed=0)
+    for _ in range(EPISODE_STEPS - 1):
+        env.step(np.zeros(len(CELLS), dtype=np.float32))
+    env.sim_result['meta']['exitcode'] = exit_code
+    return env.step(np.zeros(len(CELLS), dtype=np.float32))
+
+
+def test_truncation_surfaces_a_clean_exit_as_not_crashed():
+    """A clean simTime finish (ns-3 exitcode 0) must report crashed=False
+    and the real exit code, not silently drop both."""
+    env = make_env()
+    obs, reward, terminated, truncated, info = _drive_to_truncation(env, exit_code=0)
+    assert truncated and not terminated
+    assert info["ns3_exit_code"] == 0
+    assert info["crashed"] is False
+    env.close()
+
+
+def test_truncation_flags_a_nonzero_exit_as_crashed():
+    """The bug this guards against: a clean finish and a crash used to be
+    indistinguishable from step()'s return value alone, both landing on the
+    exact same truncation branch. A nonzero ns-3 exit code, even on an
+    otherwise-complete episode, must now be visible in info."""
+    env = make_env()
+    obs, reward, terminated, truncated, info = _drive_to_truncation(env, exit_code=1)
+    assert truncated and not terminated
+    assert info["ns3_exit_code"] == 1
+    assert info["crashed"] is True
     env.close()
 
 

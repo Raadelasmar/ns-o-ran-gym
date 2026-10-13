@@ -164,20 +164,46 @@ in the meantime (`c576d6c`, `13be2a8`, `696010f`, `083550e`):
       100x); new test `test_handover_rate_scale_is_capped_for_a_pathologically_small_window`,
       mutation-tested. The other four terms are all ratios/fractions or
       clipped-action deltas, confirmed mathematically bounded by construction.
+- [x] Run the adversarial `OutageExposure` stress test -- a fixed +3 dB
+      "sticky" margin on every cell (more restrictive, not less: the
+      too-late-handover mechanism that should actually drive outage), 10
+      seeds pooled across two parallel batches. See "`OutageExposure`
+      adversarial stress test (final)" below. Confirms the fixed-guard
+      decision with real evidence instead of only an analogy to `BadSignal`.
+- [x] Measure `ActionSmoothness` from the real policy class instead of a
+      hand-approximated Monte Carlo distribution -- a freshly-initialised,
+      untrained SB3 SAC policy (the project's own locked hyperparameters)
+      acting against a synthetic-but-representative KPI stream, no ns-3
+      needed (see `examples/mro_actionsmoothness_probe.py`). Real sd = 3.19,
+      about 3x the old guess (sd ~1.06) -- `DEFAULT_W_SMOOTH` updated from
+      0.26 to 0.086. Still not a measurement under REAL training rollouts
+      (no MRO training run has happened yet), so still provisional in that
+      narrower sense -- a measurement of the real policy class, not of real
+      training behaviour.
+- [x] Added a trajectory-ranking sanity check
+      (`examples/mro_weight_ranking_check.py`), closing the methodology
+      report's Section 5.3 gap: confirms the final weight set ranks the
+      sticky (too-restrictive-margin) arm WORSE than do-nothing, as a real
+      MRO failure mode must. PASS, with a real but modest per-step margin --
+      see below, not glossed over.
 - [ ] Build `train_mro_sac_pilot.py` mirroring `train_mlb_sac_pilot.py` (Arm C
       hyperparameters, `DiskGuard`/`MemGuard`, `CriticProbe`/`StepLogger`)
 - [ ] Run MRO's own SAC pilot against the same "does the critic climb" bar
-- [ ] Run the adversarial `OutageExposure` check (force congestion onto one
-      cell, mirroring how MLB's `BadSignal` numerator was proven alive)
-      before fully trusting `DEFAULT_W_OUTAGE`'s fixed guard value
 - [ ] Investigate the round-2 mid-run crash rate (2/5 seeds, unexplained) at
       `ues=5`/`controlInterval=0.1` before trusting a large training run on
-      this config
-- [ ] Re-measure `PingPong`/`HandoverRate`/`ActionSmoothness` statistics from
-      real training rollouts once the SAC pilot has run, per the methodology
-      report's Section 5.2 ("do not trust a do-nothing-baseline weight
-      forever") -- `ActionSmoothness` especially, since its current weight is
-      a Monte Carlo estimate, not a measurement
+      this config. NOTE: a related, narrower issue was observed live during
+      the outage-stress run -- one seed's ns-3 process logged a non-zero
+      exit code at the very end of a run that otherwise collected its full
+      299/299 steps. `MroZmqEnv.step()`'s end-of-episode branch does not
+      currently distinguish a clean `simTime` finish from a crash (both hit
+      the same `next_kpis is None` path), so this went unflagged in the
+      data itself -- harmless here (full matching row count), but worth
+      fixing (an `info["crashed"]`/exit-code flag) before trusting this for
+      real training, where a silent mid-episode crash would look identical
+      to a legitimate truncation to the training loop.
+- [ ] Re-measure `PingPong`/`HandoverRate` statistics from real training
+      rollouts once the SAC pilot has run, per the methodology report's
+      Section 5.2 ("do not trust a do-nothing-baseline weight forever")
 
 ## Baseline weight measurement, round 2 -- final (the real training config)
 
@@ -191,7 +217,7 @@ in the meantime (`c576d6c`, `13be2a8`, `696010f`, `083550e`):
 | pingpong | 1372 | 0.119 | 0.181 | 1.51 | **1.51** |
 | handover_rate | 1372 | 0.427 | 0.343 | 0.80 | **0.80** |
 | outage | 1372 | 0.0001 | 0.0017 | 159.7 (not usable) | **1.00 (fixed guard)** |
-| smoothness | -- (silent under do-nothing) | -- | 1.06 (Monte Carlo) | ~0.26 | **0.26 (provisional)** |
+| smoothness | -- (silent under do-nothing) | -- | 1.06 (Monte Carlo) | ~0.26 | superseded, see below |
 
 `OutageExposure` is confirmed alive at this config (fired on 0.01% of
 UE-steps, resolving round 1's open question), but its literal equalised
@@ -200,17 +226,119 @@ would make the reward swing enormously on the rare step it fires, the same
 failure shape MLB's own `BadSignal` term hit (never equalised, kept at its
 default instead). Per the methodology report's stated rule for rare terms,
 `DEFAULT_W_OUTAGE` is fixed at 1.00 -- a modest guard weight in the same range
-as the other four, not the 160x-scaled literal value -- pending the
-adversarial test above.
+as the other four, not the 160x-scaled literal value. The sections below
+replace the "pending the adversarial test" caveat this used to carry with a
+real result.
 
-`ActionSmoothness` cannot be measured under an all-zero baseline action by
-construction (zero delta every step), so its weight is a Monte Carlo estimate
-from an untrained-PPO-like action distribution, run through the same
-anchor-equalisation formula as the other terms. **Provisional, not a
-measurement** -- to be re-derived from real rollout logs after the SAC pilot.
+## `OutageExposure` adversarial stress test (final)
 
-**Reward weights ARE now set in code** (`DEFAULT_W_*` in `mro_zmq_env.py`),
-but two of five (`outage`, `smooth`) are documented fixed/provisional values
-rather than measurements, and none of the five have been checked against a
-real training rollout yet -- see the open items above before starting a full
-training run.
+`examples/mro_outage_stress_experiment.py`: a fixed **+3 dB "sticky" margin**
+on every cell, every step -- not an arbitrary stress hack. A MORE restrictive
+margin makes `GetEffectiveSinrThreshold` harder to satisfy, so a UE moving
+away from its serving cell stays latched onto it LONGER than it should --
+the textbook too-late-handover MRO failure mode, and exactly the mechanism
+that should drive real SINR outage. The untested opposite extreme from
+`mro_margin_experiment.py`'s already-validated "loosen" arm (easier
+handovers, irrelevant to outage).
+
+10 seeds, same locked config as round 2, run as two batches of 5 (see
+"Parallel execution" below), pooled with `examples/mro_outage_stress_pool.py`:
+
+| | n | outage mean | detrended sd | fired | derived weight |
+|---|---|---|---|---|---|
+| batch 1 (seeds 3001-3005) | 1495 | 0.0001 | 0.0013 | 3/1495 (0.201%) | 214.3 |
+| batch 2 (seeds 3006-3010) | 1495 | 0.0001 | 0.0015 | 4/1495 (0.268%) | 186.1 |
+| **pooled (10 seeds)** | **2990** | **0.0001** | **0.0014** | **7/2990 (0.234%)** | **198.7** |
+
+**Result: the mechanism is real, the fixed-guard decision was correct.**
+The firing rate rose from 0.01% (do-nothing) to 0.234% (sticky) -- about
+**20x** more frequent, confirming the stress genuinely exercises the term,
+not just the config. But even under a condition that reliably makes outage
+fire 20x more often, the literal equalised weight (198.7) lands in the same
+"clearly unusable" range as every measurement of this term so far (159.7 in
+round 2, 214.3 and 186.1 per batch). This is now a validated conclusion, not
+an assumption: no amount of realistic stress on this term produces a usable
+variance-matched weight, which is exactly the "rare term" failure mode the
+methodology report predicted, now confirmed rather than only analogised to
+`BadSignal`.
+
+**Trajectory-ranking check** (`examples/mro_weight_ranking_check.py`, closing
+the methodology report's Section 5.3 gap): applies the full candidate weight
+set (`w_quality=1.00, w_pingpong=1.51, w_churn=0.80, w_outage=1.0`) to both
+the pooled sticky-arm data and the round-2 do-nothing baseline, and checks
+the sign.
+
+| condition | n | mean reward | sd |
+|---|---|---|---|
+| do-nothing | 1372 | 0.1628 | 0.472 |
+| sticky +3 dB | 2990 | 0.1232 | 0.495 |
+
+**PASS** -- the sticky arm scores worse than do-nothing (gap +0.0396), as a
+real MRO failure mode must. Stated plainly: the margin is real but modest at
+the per-step level (well under a tenth of a standard deviation), not a
+dramatic separation -- consistent with this project's established practice
+of reporting a PASS with its actual effect size rather than only the sign.
+
+**Parallel execution.** Both batches ran with `mro_outage_stress_experiment.py
+--workers 5` (added this session): each seed as an independent OS process on
+its own ZeroMQ port, cutting wall-clock from a multi-hour sequential chain to
+roughly one seed's worth of time per batch. Two real bugs were caught and
+fixed before trusting it for the real run:
+1. A double-`SIGINT` race (two independently-issued interrupts, one via a
+   now-removed shell-script wrapper) left 5 orphaned ns-3 run directories
+   unpurged -- a second interrupt arriving while a worker's own
+   `finally: env.close()` was still unwinding aborted that cleanup
+   mid-block. Fixed by dispatching the forwarded `SIGINT` to every worker
+   **exactly once**, guarded against a repeat.
+2. `MroZmqEnv` defaults to rebuilding ns-3 on every construction
+   (`build_ns3=True`). Harmless run one at a time, but with 5 concurrent
+   workers it meant 5 simultaneous `ns3 configure` + cmake invocations
+   against the SAME build directory and CMake cache -- caught live on the
+   first real parallel attempt (didn't crash outright, but disturbed the
+   build badly enough that the next build needed to redo 1644/1644 steps
+   instead of a no-op). Fixed by passing `build_ns3=False` in `run_seed()`
+   -- same pattern `train_mlb_sac_pilot.py`'s own parallel workers already
+   use (build once, construct workers with `build_ns3=False`).
+
+Both fixes verified with short, real (not synthetic) ns-3 runs before
+trusting them for the real 10-seed measurement above.
+
+## `ActionSmoothness`, measured from the real policy class
+
+`examples/mro_actionsmoothness_probe.py`: a freshly-initialised, **untrained**
+SB3 SAC policy (the project's own locked hyperparameters -- `gamma`,
+`learning_rate`, `batch_size`, `ent_coef` from `train_mlb_sac_pilot.py`'s
+`ARM_C`; `net_arch` left at SB3's own default, since no MRO-specific
+architecture is locked anywhere yet) acting stochastically against a
+synthetic-but-representative KPI stream. No ns-3 needed: `ActionSmoothness`
+is a pure function of the action sequence, so what matters is what this
+policy class, at this initialisation, actually samples step over step, not
+how closely the KPIs resemble reality. 20 episodes x up to 300 steps, 5,980
+total steps.
+
+| | mean | detrended sd |
+|---|---|---|
+| old Monte Carlo guess | 1.99 | 1.06 |
+| **real measurement** | **7.24** | **3.19** |
+
+The real untrained SAC policy is roughly 3x more erratic than the old
+hand-approximated guess assumed -- a randomly-initialised, entropy-driven
+SAC policy tends to saturate near the action bounds early in training, more
+than the earlier guess accounted for. `w_smooth = anchor_sd(0.273) /
+detrended_sd(3.19) = 0.086`, replacing the old `0.26`.
+
+Still provisional in one narrower sense: this measures the real policy
+*class* MRO will train with, not real training *behaviour*, since no MRO
+training run has happened yet. Re-derive from real rollout logs after the
+SAC pilot, per the methodology report's Section 5.2.
+
+## Current state
+
+**Reward weights are set in code** (`DEFAULT_W_*` in `mro_zmq_env.py`):
+`w_quality=1.00`, `w_pingpong=1.51`, `w_churn=0.80` (measured, round 2),
+`w_outage=1.0` (fixed guard, now validated against a real 10-seed stress
+test), `w_smooth=0.086` (measured from the real untrained SAC policy class).
+None of the five have been checked against real MRO training rollouts yet --
+see the open items above (SAC pilot script, the crash-rate investigation,
+and re-measuring `PingPong`/`HandoverRate` once real training data exists)
+before starting a full training run.

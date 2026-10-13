@@ -163,23 +163,51 @@ DEFAULT_W_CHURN = 0.80
 # this case (Section 5, "rare terms"): a fixed, modest, NON-equalised guard
 # weight instead of the literal variance-matched one. Set to 1.0, matching
 # BadSignal's own MLB precedent and sitting inside the other MRO weights'
-# natural range (0.80-1.51) rather than the 160x-scaled outlier. A dedicated
-# adversarial test (forcing congestion onto one cell, mirroring how MLB's
-# BadSignal numerator was proven alive) is recommended before trusting this
-# further -- see docs/mro_training_fixes.md next steps.
+# natural range (0.80-1.51) rather than the 160x-scaled outlier.
+#
+# UPDATE: the recommended adversarial test has now been run for real
+# (examples/mro_outage_stress_experiment.py, fixed +3 dB "sticky" margin on
+# every cell -- a well-grounded stress, not an arbitrary one: a MORE
+# restrictive margin makes a UE linger on a degrading serving cell longer,
+# the textbook too-late-handover mechanism that should drive real outage).
+# 10 seeds, pooled (examples/mro_outage_stress_pool.py), 2,990 steps at the
+# same locked config: OutageExposure's firing rate rose from 0.01% (round-2
+# do-nothing) to 0.234% -- ~20x more frequent, confirming the mechanism is
+# real -- but its literal equalised weight is STILL unusable (198.7, in the
+# same 160-215 range as every measurement of this term so far, do-nothing or
+# stressed). The fixed-guard decision was therefore correct, now backed by a
+# real stress measurement instead of only an analogy to BadSignal.
+#
+# Also validated: examples/mro_weight_ranking_check.py confirmed this full
+# weight set (quality/pingpong/churn above, this guard) ranks the sticky arm
+# WORSE than do-nothing, as a real MRO failure mode must (mean reward 0.1232
+# vs 0.1628) -- a real but modest per-step margin (well under 0.1 sd), not a
+# dramatic one; closes the methodology report's Section 5.3 trajectory-
+# ranking gap for this term rather than leaving it unchecked.
 DEFAULT_W_OUTAGE = 1.0
 
 # SMOOTH: ActionSmoothness has no signal under an all-zero baseline action by
 # construction (constant action -> zero delta every step), so it could not be
-# measured the same way as the other four. Estimated via a Monte Carlo
-# simulation of an untrained-PPO-like action distribution instead: sd ~ 1.06.
-# Applying the SAME anchor-equalisation formula as the other terms
-# (anchor_sd / term_sd = 0.273 / 1.06) gives ~0.26. This is a rough starting
-# point, not a measurement -- PROVISIONAL, to be re-derived from real rollout
-# logs after the first MRO training run, per the methodology report's
-# Section 5.2 recommendation (re-measure under the trained policy, not only
-# the do-nothing baseline).
-DEFAULT_W_SMOOTH = 0.26
+# measured the same way as the other four from a do-nothing run.
+#
+# Measured for real instead (examples/mro_actionsmoothness_probe.py): a
+# freshly-initialised, UNTRAINED SB3 SAC policy (the project's own locked
+# SAC hyperparameters, real MroZmqEnv action/observation spaces) acting
+# stochastically for 20 episodes x 300 steps against a synthetic-but-
+# representative KPI stream -- no ns-3 needed, since this term is a pure
+# function of the action sequence, not of network physics. Real measured
+# sd = 3.19, roughly 3x the earlier Monte Carlo GUESS (sd ~1.06) this value
+# used to be based on: an untrained SAC policy's entropy-driven exploration
+# is considerably more erratic than the hand-approximated distribution
+# assumed, since a randomly-initialised tanh-squashed Gaussian policy tends
+# to saturate near the action bounds early in training.
+# w_smooth = anchor_sd(0.273) / detrended_sd(3.19) = 0.086. Still not a
+# measurement under REAL training rollouts (the actual SAC pilot hasn't run
+# yet), so still provisional in that sense -- but a measurement of the real
+# policy class MRO will train with, not an approximation of one. Re-derive
+# from real rollout logs after the first MRO training run, per the
+# methodology report's Section 5.2 recommendation.
+DEFAULT_W_SMOOTH = 0.086
 
 
 def obs_index(cell: int, field: str) -> int:
@@ -488,7 +516,21 @@ class MroZmqEnv(NsOranEnv):
             last_kpis = self._pending_kpis
             obs = self._get_obs(last_kpis)
             self._pending_kpis = None
-            return obs, 0.0, self.terminated, self.truncated, {"kpis": last_kpis, "margin_offsets": cell_actions}
+            # ns3_exit_code / crashed: a clean simTime finish and a crash
+            # used to be indistinguishable here -- both land on this exact
+            # branch, since _recv_next_kpis() returns None either way. Found
+            # live during the OutageExposure stress run: one seed logged a
+            # nonzero ns-3 exit yet still produced a full, matching step
+            # count -- harmless that time, but nothing in the collected data
+            # could have proven that after the fact. is_simulation_over()
+            # (called inside the _recv_next_kpis() loop above, via the base
+            # class) already computes and stores the real exit code on
+            # self.sim_result['meta']['exitcode'] before returning; this
+            # just surfaces it instead of discarding it.
+            exit_code = self.sim_result.get('meta', {}).get('exitcode')
+            info = {"kpis": last_kpis, "margin_offsets": cell_actions,
+                    "ns3_exit_code": exit_code, "crashed": exit_code not in (0, None)}
+            return obs, 0.0, self.terminated, self.truncated, info
 
         self._pending_kpis = next_kpis
         terms = self._reward_terms(next_kpis, margin)

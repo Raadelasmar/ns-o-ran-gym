@@ -23,7 +23,10 @@ Usage:
 """
 import argparse
 import csv
+import multiprocessing as mp
 import os
+import queue
+import signal
 import sys
 from os import path
 
@@ -51,6 +54,17 @@ CFG = {
     "handoverMode": ["DynamicTtt"], "indicationPeriodicity": [0.1],
     "e2nrEnabled": [1], "rlcAmEnabled": [1],
     "controlInterval": [0.1],
+    # Ra'ed's sim-baseline handover-stability switches (merged into
+    # feature/mro-agent 2026-10-09), adopted for MRO with ONE deliberate
+    # exception -- see train_mro_sac_pilot.py's CFG for the full per-flag
+    # rationale. handoverHysteresisDb stays at 0 (NOT his v8 value of 3):
+    # HysteresisAllowsHandover() gates MRO's primary handover-trigger
+    # decision under handoverMode=DynamicTtt and only reduces to "no gate,
+    # previous behaviour" when this is <= 0 -- turning it on would silently
+    # stop MRO's own margin action from controlling that decision.
+    "channelConditionUpdatePeriodMs": [0], "handoverSinrFilterTauMs": [400],
+    "handoverHysteresisDb": [0], "tttFromBiasedSinr": [1],
+    "controlPhaseOffsetS": [0.001],
     "ns3::MmWavePhyTrace::OutputFilename": ["/dev/null"],
     "ns3::MmWavePhyTrace::DlPhyTransmissionFilename": ["/dev/null"],
     "ns3::MmWaveMacTrace::SchedInfoOutputFilename": ["/dev/null"],
@@ -64,15 +78,24 @@ CFG = {
 TERMS = ("quality", "pingpong", "handover_rate", "outage")
 
 
-def run_seed(seed: int, args) -> list:
-    """One do-nothing episode; returns a list of per-step term dicts."""
+def run_seed(seed: int, args, zmq_port: int) -> list:
+    """One do-nothing episode; returns a list of per-step term dicts.
+
+    zmq_port is explicit, not read off args, so a parallel caller can hand
+    each concurrently-running seed its own port -- see run_all_seeds() and
+    mro_outage_stress_experiment.py's PARALLEL EXECUTION docs for the full
+    rationale (including why build_ns3=False is not optional with
+    --workers > 1: several concurrent `ns3 configure` invocations against
+    the same build directory corrupted a build earlier this session).
+    """
     cfg = dict(CFG)
     cfg["RngRun"] = [seed]
     cfg["simTime"] = [args.simtime]
 
     env = MroZmqEnv(ns3_path=args.ns3_path, scenario_configuration=cfg,
                     output_folder=args.output_folder, optimized=False,
-                    zmq_port=args.zmq_port,
+                    zmq_port=zmq_port,
+                    build_ns3=False,
                     vary_rng_run_per_episode=False,   # this seed, not a redraw
                     purge_sim_path_on_close=True)      # pure measurement, keep no run dirs
 
@@ -101,6 +124,79 @@ def run_seed(seed: int, args) -> list:
         env.close()
     print(f"  seed {seed}: {len(rows)} steps collected", flush=True)
     return rows
+
+
+def _worker_entry(seed: int, args, zmq_port: int, result_queue) -> None:
+    """multiprocessing target: run one seed, put its result on the queue."""
+    rows = run_seed(seed, args, zmq_port)
+    result_queue.put((zmq_port, seed, rows))
+
+
+def run_all_seeds(seeds: list, args):
+    """Yields (seed, rows) as each seed finishes. Identical mechanism to
+    mro_outage_stress_experiment.py's run_all_seeds -- see that module's
+    PARALLEL EXECUTION docstring for the full rationale, including the
+    single-dispatch SIGINT forwarding and why a worker that exits without
+    reporting is reaped rather than left to hang the loop.
+    """
+    if args.workers <= 1:
+        for seed in seeds:
+            yield seed, run_seed(seed, args, args.zmq_port)
+        return
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    n_workers = min(args.workers, len(seeds))
+    pending = list(seeds)
+    running: dict = {}
+    shutdown = {"requested": False}
+
+    def launch(port: int) -> None:
+        if not pending or shutdown["requested"]:
+            return
+        seed = pending.pop(0)
+        p = ctx.Process(target=_worker_entry, args=(seed, args, port, result_queue))
+        p.start()
+        running[port] = (p, seed)
+        print(f"  seed {seed}: launched on port {port} (pid {p.pid})", flush=True)
+
+    def handle_sigint(signum, frame):
+        if shutdown["requested"]:
+            return
+        shutdown["requested"] = True
+        print(f"\nInterrupted -- forwarding SIGINT once to {len(running)} running "
+              f"worker(s); each will run its own cleanup before exiting.", flush=True)
+        for p, seed in running.values():
+            if p.is_alive():
+                os.kill(p.pid, signal.SIGINT)
+
+    old_handler = signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        for port in (args.zmq_port + i for i in range(n_workers)):
+            launch(port)
+
+        while running or (pending and not shutdown["requested"]):
+            if not running:
+                break
+            try:
+                port, seed, rows = result_queue.get(timeout=1.0)
+            except queue.Empty:
+                dead = [p_ for p_, (proc, _) in running.items() if not proc.is_alive()]
+                for p_ in dead:
+                    proc, dead_seed = running.pop(p_)
+                    print(f"  seed {dead_seed}: worker exited without reporting "
+                          f"(exit code {proc.exitcode}), treating as crashed/interrupted",
+                          flush=True)
+                    yield dead_seed, []
+                    launch(p_)
+                continue
+            running.pop(port, None)
+            yield seed, rows
+            launch(port)
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+        for p, seed in list(running.values()):
+            p.join(timeout=15)
 
 
 def detrended_sd(rows: list, term: str) -> tuple:
@@ -142,6 +238,12 @@ if __name__ == "__main__":
     ap.add_argument("--seed_start", type=int, default=2001)
     ap.add_argument("--simtime", type=int, default=30)
     ap.add_argument("--zmq_port", type=int, default=5555)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="run this many seeds concurrently, each its own OS "
+                         "process on its own ZeroMQ port (--zmq_port + slot "
+                         "index). Default 1 = sequential. See "
+                         "mro_outage_stress_experiment.py's module docstring "
+                         "before raising this.")
     ap.add_argument("--ns3_path", default=path.expanduser("~/oran-project/ns-3-mmwave-oran"))
     ap.add_argument("--output_folder", default=path.join(path.dirname(__file__), "..", "output"))
     ap.add_argument("--csv_out", default=path.join(path.dirname(__file__), "..", "output",
@@ -153,7 +255,9 @@ if __name__ == "__main__":
     else:
         seeds = list(range(args.seed_start, args.seed_start + args.n_seeds))
 
-    print(f"Running {len(seeds)} do-nothing baseline seeds: {seeds}", flush=True)
+    print(f"Running {len(seeds)} do-nothing baseline seeds: {seeds} "
+          f"({'sequential' if args.workers <= 1 else f'{min(args.workers, len(seeds))} concurrent workers'})",
+          flush=True)
     # Written incrementally, one seed at a time, flushed and fsync'd after
     # each -- a run that gets interrupted (Ctrl-C, machine shutdown) keeps
     # every seed that had already finished. This USED to hold everything in
@@ -166,8 +270,7 @@ if __name__ == "__main__":
         writer = csv.DictWriter(f, fieldnames=["seed", "step", "reward"] + list(TERMS))
         writer.writeheader()
         f.flush()
-        for seed in seeds:
-            rows = run_seed(seed, args)
+        for seed, rows in run_all_seeds(seeds, args):
             all_rows.extend(rows)
             writer.writerows(rows)
             f.flush()
