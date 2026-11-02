@@ -31,14 +31,25 @@ CELLS = [2, 3, 4, 5, 6, 7, 8]
 #                        agent visibility into which cells are outage risks
 #   handover_activity -- handovers touching this cell (as source OR target)
 #                        this window, per active user network-wide
-#   last_margin_db    -- the agent's own previous action for this cell, so a
-#                        smoothness-penalised policy can see what it last set
+#   last_pair_margin_db -- mean |offset| over every directed cell-pair margin
+#                        currently applied that touches this cell (as serving
+#                        OR candidate), so the policy can see roughly how much
+#                        correction is active nearby. v3 replaces the old
+#                        per-cell last_margin_db (a single signed scalar per
+#                        cell) with this: under the pairwise action (see
+#                        PairMarginState) a cell can be touched by several
+#                        directed-pair offsets of different signs at once, so
+#                        there is no single signed "this cell's margin" left
+#                        to report -- this is a magnitude proxy instead,
+#                        always >= 0 (also feeds the ActionSmoothness
+#                        diagnostic -- not reward-weighted, see
+#                        REWARD_FORMULA_VERSION)
 # prb_utilization is deliberately NOT included: it is MLB's primary decision
 # variable, not MRO's, and the coordinator-blueprint design keeps each agent's
 # observation scoped to its own function (MobilityScore) rather than pulling in
 # LoadScore inputs it does not act on.
 OBS_FIELDS = ("sinr_db_mean", "num_active_ues", "badsignal_frac",
-              "handover_activity", "last_margin_db")
+              "handover_activity", "last_pair_margin_db")
 
 # Same bounds and same empirical reason as MlbZmqEnv: this is the identical
 # physical SINR quantity from the identical simulator. The ceiling was widened
@@ -54,19 +65,24 @@ SINR_SCALE_DB = 40.0
 # that looks like "every UE handed over exactly once".
 HANDOVER_ACTIVITY_CEIL = 3.0
 
-OBS_LOW_PER_CELL = np.array([SINR_FLOOR_DB / SINR_SCALE_DB, 0.0, 0.0, 0.0, -1.0],
+OBS_LOW_PER_CELL = np.array([SINR_FLOOR_DB / SINR_SCALE_DB, 0.0, 0.0, 0.0, 0.0],
                             dtype=np.float32)
 OBS_HIGH_PER_CELL = np.array([SINR_CEIL_DB / SINR_SCALE_DB, 1.0, 1.0,
                               HANDOVER_ACTIVITY_CEIL, 1.0], dtype=np.float32)
 OBS_LOW = np.tile(OBS_LOW_PER_CELL, len(CELLS))
 OBS_HIGH = np.tile(OBS_HIGH_PER_CELL, len(CELLS))
 
-# action[i] is a per-cell handover-margin OFFSET in dB for cell CELLS[i], added
-# to (not replacing) the network's base HoSinrDifference. +-3 dB is a
-# conservative starting bound -- unlike CIO's +-6 dB, this has not yet been
-# validated against a live controller and should be revisited once it has, the
-# same way CIO's own limit was locked from early placeholder-heuristic use
-# rather than derived from first principles.
+# Ceiling on any single directed cell-pair handover-margin OFFSET in dB,
+# added to (not replacing) the network's base HoSinrDifference for that
+# (serving, candidate) pair -- see PairMarginState. +-3 dB is a conservative
+# starting bound -- unlike CIO's +-6 dB, this has not yet been validated
+# against a live controller and should be revisited once it has, the same way
+# CIO's own limit was locked from early placeholder-heuristic use rather than
+# derived from first principles. v2's action_space bound (a flat per-cell
+# margin) used this same constant directly; v3's action_space bounds the
+# AGENT'S own additive correction instead (see ROLE_DELTA_MAX_DB) -- this
+# constant now only bounds the final, combined, per-pair offset actually
+# applied.
 MARGIN_LIMIT_DB = 3.0
 
 # RLF proxy threshold. Real RLF detection does not exist in this ns-3 fork
@@ -135,24 +151,36 @@ HANDOVER_WINDOW_FLOOR_S = HANDOVER_RATE_REF_S / 100.0
 # MlbZmqEnv.REWARD_FORMULA_VERSION -- see c576d6c and its own Step 10i
 # postscript for why comparing a raw reward field across a formula change,
 # without this stamp, can look like a real physical effect when it is not.
-REWARD_FORMULA_VERSION = 1
+# v1 -> v2: ActionSmoothness removed from the sum (see DEFAULT_W_OUTAGE's
+# neighbouring comment for why) -- any reward measured under v1 is not
+# comparable to one measured under v2.
+REWARD_FORMULA_VERSION = 2
 
-# Reward weights. Measured from 5 seeded do-nothing baselines at Ra'ed's
-# locked SAC config (ues=5, simTime=30, controlInterval=0.1, RLC AM),
-# 1,372 pooled control steps -- see docs/mro_training_fixes.md and
-# 20260910_Dani_mro_reward_implementation.pdf Section 5. Same method as
-# MLB's own weights: equalise each term's *detrended* standard deviation,
+# Reward weights. Re-derived (3rd time) from a 5-seed x 3-arm, simTime=30,
+# 1,495-steps/arm do-nothing baseline measured AFTER the lte-enb-rrc.cc
+# TttBasedHandover wiring fix (the `sinrDifference > GetEffectiveSinrThreshold
+# (maxSinrCellId)` term added to the primary trigger condition -- see
+# mro_investigation_log.md's [01:35]-[06:35] entries for the full trace and
+# validation). These weights are only valid together with that fix: it
+# changes the do-nothing baseline's own term distributions (restoring the
+# 3GPP-standard 3dB base hysteresis that TttBasedHandover's primary branch had
+# been skipping), not only MRO's controllable range, so every prior weight
+# measurement in this file's git history was taken under the un-wired
+# baseline and is stale. Same detrended-sd equalisation method as always,
 # quality anchored at 1.0. Do NOT re-derive these by re-running the
-# equalisation formula blindly -- two of the five needed a documented
-# deviation from the literal measured value; see below.
+# equalisation formula blindly -- OUTAGE needed a documented deviation from
+# the literal measured value; see below.
 #
-# QUALITY / PINGPONG / CHURN: the literal equalised values. 1,076/1,372
-# steps had a measurable HandoverQuality; PingPong and HandoverRate used
-# 1,372/1,372 (rate-normalised via HANDOVER_RATE_REF_S, so these are
-# comparable across control periods).
+# QUALITY / PINGPONG / CHURN: the literal equalised values under the fixed
+# wiring. The trajectory-ranking check (examples/mro_weight_ranking_check.py)
+# confirmed both the tighten (+3dB) and loosen (-3dB) margin arms now rank
+# worse than do-nothing under these weights -- loosen's margin is large and
+# decisive (-0.232 vs +0.153), not a marginal pass; it had ranked BETTER than
+# do-nothing (wrongly) under the pre-fix weights below it in this file's
+# history, which is exactly what the wiring fix was meant to correct.
 DEFAULT_W_QUALITY = 1.00
-DEFAULT_W_PINGPONG = 1.51
-DEFAULT_W_CHURN = 0.80
+DEFAULT_W_PINGPONG = 9.39
+DEFAULT_W_CHURN = 1.21
 
 # OUTAGE: the literal equalised value is 159.7 -- NOT usable. OutageExposure
 # fired on only 0.01% of UE-steps in round 2; matching its variance to
@@ -186,28 +214,300 @@ DEFAULT_W_CHURN = 0.80
 # ranking gap for this term rather than leaving it unchecked.
 DEFAULT_W_OUTAGE = 1.0
 
-# SMOOTH: ActionSmoothness has no signal under an all-zero baseline action by
-# construction (constant action -> zero delta every step), so it could not be
-# measured the same way as the other four from a do-nothing run.
+# SMOOTH: dropped from the reward sum entirely (was DEFAULT_W_SMOOTH=0.086,
+# measured from an untrained SAC policy's action distribution -- see git
+# history on this block for that derivation). The first full MRO SAC pilot
+# (docs/mro_training_fixes.md) showed why that measurement couldn't work as a
+# shaping weight: it was calibrated against RANDOM noise, not a learning
+# signal, and ActionSmoothness turned out to be the only term easy enough to
+# improve that the agent fixated on it -- collapsing smoothness ~5x while
+# quality/handover_rate/pingpong/outage never moved. The term also traces to
+# an MLB-specific failure mode (an undamped controller oscillating 3 dB/step)
+# imported by analogy, never confirmed as an MRO problem of its own.
+# ActionSmoothness is still computed and logged every step (see
+# _reward_terms's returned dict) -- useful as a diagnostic, just no longer
+# part of the sum.
+
+
+# =============================================================================
+# v3: pairwise handover-margin action, 3GPP TR 36.839-style roles
+# =============================================================================
+# Replaces v2's flat per-cell margin action with a per-DIRECTED-cell-pair
+# margin, decided via two roles grounded in 3GPP TR 36.839's MRO failure
+# taxonomy (too-late HO, too-early HO, ping-pong, handover-to-wrong-cell) --
+# see the 2026-10-25 plan discussion for the literature trail (TR 36.839;
+# Weaver & Monogioudis, "Self-Organizing MRO in LTE Networks with eICIC";
+# FuzAMP-style fuzzy-MRO combination controllers).
 #
-# Measured for real instead (examples/mro_actionsmoothness_probe.py): a
-# freshly-initialised, UNTRAINED SB3 SAC policy (the project's own locked
-# SAC hyperparameters, real MroZmqEnv action/observation spaces) acting
-# stochastically for 20 episodes x 300 steps against a synthetic-but-
-# representative KPI stream -- no ns-3 needed, since this term is a pure
-# function of the action sequence, not of network physics. Real measured
-# sd = 3.19, roughly 3x the earlier Monte Carlo GUESS (sd ~1.06) this value
-# used to be based on: an untrained SAC policy's entropy-driven exploration
-# is considerably more erratic than the hand-approximated distribution
-# assumed, since a randomly-initialised tanh-squashed Gaussian policy tends
-# to saturate near the action bounds early in training.
-# w_smooth = anchor_sd(0.273) / detrended_sd(3.19) = 0.086. Still not a
-# measurement under REAL training rollouts (the actual SAC pilot hasn't run
-# yet), so still provisional in that sense -- but a measurement of the real
-# policy class MRO will train with, not an approximation of one. Re-derive
-# from real rollout logs after the first MRO training run, per the
-# methodology report's Section 5.2 recommendation.
-DEFAULT_W_SMOOTH = 0.086
+#   too-late(s -> c), DIRECTIONAL: a UE stays on serving cell s while
+#   candidate c's SINR has been clearly better for a sustained fraction of
+#   the window -- lowers margin(s -> c) only.
+#
+#   churn(a, b), PAIR-LEVEL: cells a and b have returned a UE to each other
+#   within PINGPONG_Y_S more than CHURN_RATE_THRESHOLD of the window --
+#   raises margin both directions. Merges the literature's too-early-HO and
+#   ping-pong categories: current telemetry (handover events as
+#   (t, imsi, src, dst), no RLF flag) cannot distinguish an RLF-tagged
+#   too-early return from a plain short-stay return. A genuinely new
+#   literature category -- handover-to-wrong-cell (fails at the target,
+#   re-establishes on a THIRD cell) -- is a neighbor-relation/CIO problem,
+#   not a 2-cell margin problem, and is NOT addressed here.
+#
+# Conflicting signals on the same pair are not resolved by one role
+# overriding the other (that is exactly the "race condition" Weaver &
+# Monogioudis warn independently-set, uncoordinated biases on a pair cause):
+# both contribute a signed, rate-excess-weighted correction to the same
+# directed offset, which is then rate-limited and clamped -- see
+# _pairwise_margin_targets and PairMarginState.
+#
+# The agent's action is a 2-dim ADDITIVE correction to a FIXED per-role base
+# gain, not the gain itself -- mirrors the manuscript's MLB design
+# (b_p = b_p^rule + delta*s_p*c_role): zero-initialising the actor's mean
+# output layer (see train_mro_sac_pilot.py) then makes the untrained policy
+# reproduce the pure rule-based baseline (BASE_*_GAIN_DB) exactly, the same
+# warm-start property MLB's own recipe relies on.
+PAIR_RATE_WINDOW_STEPS = 5          # same window length v2a validated for
+                                     # its own per-cell rolling rates
+TOO_LATE_SINR_MARGIN_DB = 3.0       # candidate must beat serving by this much
+                                     # to count as a qualifying sample
+# TOO_LATE_RATE_THRESHOLD / CHURN_RATE_THRESHOLD were both 0.3 until
+# 2026-10-27, when a direct empirical measurement (examples/
+# mro_v3_role_rate_diagnostic.py, examples/mro_v3_sinr_gap_diagnostic.py; 10
+# real episodes, ues=5, simTime=10) found 0.3 was structurally unreachable
+# for either role under PAIR_RATE_WINDOW_STEPS=5's quantization (rates only
+# take values in {0, 0.2, 0.4, ..., 1.0}): too_late_rate was nonzero in 0 of
+# 990 observed steps, and churn_rate's only observed nonzero value, across
+# 10 seeds, was exactly 0.2 (15 samples, 3/10 seeds). With the 0.3 threshold
+# every pair's `excess = rate - threshold` was <= 0.0 everywhere, every step
+# -- the entire role-gated margin mechanism (_pairwise_margin_targets) was a
+# structural no-op, independent of any agent action (confirmed separately: a
+# trained policy's actions produced a per-step trajectory byte-identical to
+# the zero-action rule baseline across all tested seeds).
+#
+# too_late's near-zero firing rate is NOT a threshold problem: the SINR-gap
+# diagnostic found a UE is reported under more than one cell's measurement
+# (the prerequisite for ANY serving-vs-candidate comparison) in only 11 of
+# 34 055 UE-steps (0.03%) under this ues=5 scenario, and even those 11 rarely
+# show the candidate ahead (mean gap -6.56 dB, max +0.77 dB, i.e. still well
+# short of TOO_LATE_SINR_MARGIN_DB=3.0). Lowering TOO_LATE_RATE_THRESHOLD
+# cannot fix a qualifying condition that the KPI stream almost never has the
+# raw data to evaluate in the first place; this is a known, documented
+# limitation of the role under this scenario's sparse per-UE cell-overlap
+# reporting, not a bug. Left at 0.0 (consistent with churn, below) so the
+# role is live as designed if its prerequisite condition does fire.
+#
+# churn's threshold is lowered to 0.0 (full excess = rate on any qualifying
+# window), since window=5's coarsest step (0.2, a single ping-pong event in
+# the window) is the ONLY value this session ever observed firing -- any
+# threshold at or above that is equally unreachable, and splitting hairs
+# below it (e.g. 0.1) only shrinks the resulting gain for no benefit.
+TOO_LATE_RATE_THRESHOLD = 0.0
+CHURN_RATE_THRESHOLD = 0.0
+# Starting points, same order of magnitude as v2a's own validated step_db
+# (0.5) and dead_band (0.3) -- NOT yet empirically validated for v3, same
+# caveat MARGIN_LIMIT_DB's own comment carries.
+BASE_TOO_LATE_GAIN_DB = 1.0
+BASE_CHURN_GAIN_DB = 1.0
+ROLE_DELTA_MAX_DB = 3.0             # agent action_space bound (the additive
+                                     # correction, not the combined gain)
+PAIR_RATE_LIMIT_DB_PER_STEP = 0.5   # hard rate limiter on the APPLIED
+                                     # per-pair offset -- bundled per the
+                                     # 2026-10-25 plan (Python side; the ns-3
+                                     # SetHandoverMarginOffset clamp to
+                                     # [-3, +3] is the C++-side safety net)
+
+ALL_CELL_PAIRS_UNDIRECTED = tuple(
+    (CELLS[i], CELLS[j]) for i in range(len(CELLS)) for j in range(i + 1, len(CELLS)))
+ALL_CELL_PAIRS_DIRECTED = tuple((a, b) for a in CELLS for b in CELLS if a != b)
+
+
+def _extract_ue_cell_sinr_matrix(kpis: dict) -> dict:
+    """{imsi: {cell: l3_sinr_db}}, every (UE, cell) measurement reported
+    anywhere in the payload -- unlike _extract_ue_sinr, nothing is collapsed.
+
+    A UE measured by more than one cell in the same step is the expected
+    case near a cell boundary, not an edge case: ns-3 source audit confirms
+    LteEnbRrc::m_imsiCellSinrMap is a genuine per-UE candidate-cell map (the
+    handover-ranking code scans ALL of a UE's entries in it to find
+    maxSinrCellId), and scenario-marl-zmq.cc emits "l3_serving_sinr_db"
+    under EVERY cell that has a measurement for that imsi -- the field name
+    is legacy from when only the serving cell's value was consumed; it is
+    really "this UE's L3 SINR to this cell". _extract_ue_sinr's flat
+    {imsi: sinr} dict silently collapses this to whichever cell iterates
+    last for a given imsi, which is fine for its own callers (Quality/Outage
+    want a single current reading, not a matrix) but wrong for this: the
+    too-late diagnostic needs the full per-candidate picture.
+    """
+    matrix: dict = {}
+    for cell_str, cell_kpis in (kpis or {}).get("cells", {}).items():
+        try:
+            cell = int(cell_str)
+        except (TypeError, ValueError):
+            continue
+        for imsi_str, ue in (cell_kpis.get("ues") or {}).items():
+            sinr = ue.get("l3_serving_sinr_db")
+            if sinr is None:
+                continue
+            try:
+                imsi = int(imsi_str)
+            except (TypeError, ValueError):
+                continue
+            try:
+                matrix.setdefault(imsi, {})[cell] = float(sinr)
+            except (TypeError, ValueError):
+                continue
+    return matrix
+
+
+class PairRoleTracker:
+    """Stateful: rolling per-pair role-rate tracking for MRO v3's two roles.
+
+    One instance per episode (own per-pair windows and best-effort
+    UE->serving-cell map reset at episode start, same discipline as
+    MroZmqEnv._handover_history).
+    """
+
+    def __init__(self, window: int = PAIR_RATE_WINDOW_STEPS):
+        self.window = window
+        self._serving_cell: dict = {}
+        self._too_late_hist = {pair: [] for pair in ALL_CELL_PAIRS_DIRECTED}
+        self._churn_hist = {pair: [] for pair in ALL_CELL_PAIRS_UNDIRECTED}
+
+    def _update_serving_cell(self, handovers: list, sinr_matrix: dict) -> None:
+        for _, imsi, _src, dst in handovers:
+            self._serving_cell[imsi] = dst
+        for imsi, cell_sinrs in sinr_matrix.items():
+            known = self._serving_cell.get(imsi)
+            if known not in cell_sinrs and len(cell_sinrs) == 1:
+                # Self-healing best-effort: an unambiguous single-cell
+                # report (or no prior knowledge at all) is taken as the
+                # serving cell. A UE reported under >1 cell with no prior
+                # knowledge is left unresolved for this step rather than
+                # guessed -- it will typically resolve on its next handover
+                # event or the next unambiguous single-cell snapshot.
+                self._serving_cell[imsi] = next(iter(cell_sinrs))
+
+    def update(self, kpis: dict, handovers: list, handover_history: list) -> tuple:
+        """Advances every pair's rolling window by one step using THIS
+        step's kpis/handovers, and returns the current
+        (too_late_rate, churn_rate) dicts -- each pair -> fraction of the
+        window with a qualifying sample, INCLUDING this step.
+        """
+        sinr_matrix = _extract_ue_cell_sinr_matrix(kpis)
+        self._update_serving_cell(handovers, sinr_matrix)
+
+        qualifies_too_late = set()
+        for imsi, cell_sinrs in sinr_matrix.items():
+            serving = self._serving_cell.get(imsi)
+            if serving is None or serving not in cell_sinrs:
+                continue
+            serving_sinr = cell_sinrs[serving]
+            for cell, sinr in cell_sinrs.items():
+                if cell != serving and sinr - serving_sinr >= TOO_LATE_SINR_MARGIN_DB:
+                    qualifies_too_late.add((serving, cell))
+
+        # Identical pairing rule to _reward_terms's own PingPong detector
+        # (a return leg for the SAME imsi, within PINGPONG_Y_S, swapping src
+        # and dst), just bucketed per undirected pair instead of summed
+        # globally. handover_history is the SAME rolling buffer
+        # _reward_terms maintains -- see MroZmqEnv._reward_terms for why
+        # this method is called from there (ordering: the buffer must
+        # already include this step's own handovers for the pairing to see
+        # a same-step return leg, exactly like PingPong's own logic).
+        qualifies_churn = set()
+        for t, imsi, src, dst in handovers:
+            for tp, ip, sp, dp in handover_history:
+                if ip != imsi or tp >= t:
+                    continue
+                if t - tp <= PINGPONG_Y_S and sp == dst and dp == src:
+                    qualifies_churn.add((src, dst) if src < dst else (dst, src))
+                    break
+
+        too_late_rate = {}
+        for pair in ALL_CELL_PAIRS_DIRECTED:
+            h = self._too_late_hist[pair]
+            h.append(pair in qualifies_too_late)
+            if len(h) > self.window:
+                h.pop(0)
+            too_late_rate[pair] = sum(h) / len(h)
+
+        churn_rate = {}
+        for pair in ALL_CELL_PAIRS_UNDIRECTED:
+            h = self._churn_hist[pair]
+            h.append(pair in qualifies_churn)
+            if len(h) > self.window:
+                h.pop(0)
+            churn_rate[pair] = sum(h) / len(h)
+
+        return too_late_rate, churn_rate
+
+
+def _pairwise_margin_targets(too_late_rate: dict, churn_rate: dict,
+                              too_late_gain: float, churn_gain: float) -> dict:
+    """{(src, dst): target_db}, pre-rate-limit pre-clip, for every directed
+    pair touched by either role this step.
+
+    Both roles contribute to the SAME directed offset when they disagree
+    (see the module-level docstring above on why this is additive-and-bounded
+    rather than one role overriding the other): churn raises both directions
+    of a pair, too-late lowers one specific direction, and a pair hit by both
+    nets out to whichever pulls harder rather than either being silently
+    discarded.
+    """
+    targets: dict = {}
+
+    def add(key, delta):
+        targets[key] = targets.get(key, 0.0) + delta
+
+    for (a, b), rate in churn_rate.items():
+        excess = rate - CHURN_RATE_THRESHOLD
+        if excess > 0.0:
+            delta = churn_gain * excess
+            add((a, b), delta)
+            add((b, a), delta)
+
+    for (s, c), rate in too_late_rate.items():
+        excess = rate - TOO_LATE_RATE_THRESHOLD
+        if excess > 0.0:
+            add((s, c), -too_late_gain * excess)
+
+    return targets
+
+
+class PairMarginState:
+    """Stateful: the actually-applied (rate-limited, clamped) per-directed-
+    pair margin offset. One instance per episode.
+
+    A pair that converges to exactly 0.0 dB is dropped from internal state
+    after being returned once more at that value: ns-3's own
+    m_hysteresisMarginOffset map has by then received the explicit 0.0 reset
+    (map entries never expire on their own -- see LteEnbRrc::
+    SetHandoverMarginOffset), so nothing further needs to be sent for that
+    pair, and if it is targeted again later it correctly starts from 0.0
+    either way.
+    """
+
+    def __init__(self):
+        self._offsets: dict = {}
+
+    def offsets_touching(self, cell: int) -> list:
+        return [v for (s, d), v in self._offsets.items() if s == cell or d == cell]
+
+    def step(self, targets: dict) -> dict:
+        keys = set(self._offsets) | set(targets)
+        result = {}
+        next_state = {}
+        for key in keys:
+            cur = self._offsets.get(key, 0.0)
+            tgt = targets.get(key, 0.0)
+            delta = float(np.clip(tgt - cur, -PAIR_RATE_LIMIT_DB_PER_STEP,
+                                  PAIR_RATE_LIMIT_DB_PER_STEP))
+            new = float(np.clip(cur + delta, -MARGIN_LIMIT_DB, MARGIN_LIMIT_DB))
+            result[key] = new
+            if new != 0.0:
+                next_state[key] = new
+        self._offsets = next_state
+        return result
 
 
 def obs_index(cell: int, field: str) -> int:
@@ -284,26 +584,34 @@ class MroZmqEnv(NsOranEnv):
     the source-level audit behind every substitution made versus the original
     reward-design brief.
 
-    ACTION IS NOT YET WIRED ON THE ns-3 SIDE.
+    ACTION: v3, PAIRWISE handover-margin offsets.
     -----------------------------------------
-    step() sends {"cells": {cellId: {"ho_margin_db": ...}}} over the same
-    ZeroMQ bridge MLB uses, but LteEnbNetDevice::ApplyControlPayload
-    (lte-enb-net-device.cc) currently only recognises "cio_offset" -- an entry
-    containing only "ho_margin_db" is silently skipped, so THIS ACTION IS
-    CURRENTLY A NO-OP AGAINST THE REAL SIMULATOR. Training against real ns-3
-    today would be training against a fixed base margin regardless of the
-    agent's output. The ns-3 side (converting LteEnbRrc::m_sinrThresholdDifference
-    into a per-cell map and adding the ApplyControlPayload branch) is tracked
-    as separate work on the ns-3 repo's own feature/mro-agent branch. Reward
-    and observation logic here does not depend on that landing first, so this
-    file, and stub-driven tests against it, can be built and verified now.
+    step() sends {"cells": {srcCellId: {"ho_margin_pairs": {dstCellId:
+    marginDb, ...}}}} over the same ZeroMQ bridge MLB uses.
+    LteEnbNetDevice::ApplyControlPayload (lte-enb-net-device.cc) parses this
+    into LteEnbRrc::SetHandoverMarginOffset(servingCellId, targetCellId,
+    offsetDb), keyed by the (serving, target) PAIR -- see
+    LteEnbRrc::GetEffectiveSinrThreshold. Both the ns-3-side pairwise keying
+    and this file's action-shaping were landed together (v3, 2026-10-25); the
+    7-cell topology makes GetUeMap()/m_imsiCellSinrMap already report a
+    genuine per-candidate-cell SINR matrix per UE (confirmed by source audit,
+    not assumed -- see _extract_ue_cell_sinr_matrix), which is what makes the
+    too-late role diagnostic possible without any further ns-3 instrumentation.
 
     SB3-TRAINABLE SURFACE
     ----------------------
     observation_space: Box(35,), float32 -- one 5-field OBS_FIELDS block per
         cell in the fixed CELLS order. See obs_index().
-    action_space: Box(-3, 3, (7,)), float32 -- per-cell handover-margin offset
-        in dB, action[i] -> cell CELLS[i].
+    action_space: Box(-ROLE_DELTA_MAX_DB, +ROLE_DELTA_MAX_DB, (2,)), float32
+        -- the agent's ADDITIVE correction to two FIXED per-role base gains
+        (BASE_TOO_LATE_GAIN_DB, BASE_CHURN_GAIN_DB), combined then clamped to
+        [0, MARGIN_LIMIT_DB] (see _pairwise_payload_from_action). action=0
+        reproduces the pure rule-based baseline exactly -- see the v3 module
+        docstring above PairRoleTracker for why this is a deliberate
+        warm-start property, not a coincidence. The 2 scalars are NOT a
+        per-cell margin any more: the env internally expands them into
+        per-directed-pair offsets via PairRoleTracker + _pairwise_margin_targets
+        + PairMarginState's rate limiter.
     reward: the five-term MRO reward (see _reward_terms): HandoverQuality
         (replaces the brief's literal HO-success rate, which the ns-3 source
         audit found would read a constant 1.0 in this simulator), PingPong,
@@ -323,7 +631,6 @@ class MroZmqEnv(NsOranEnv):
                  sinr_agg: str = "mean", recv_timeout_ms: int = 2000,
                  w_quality: float = DEFAULT_W_QUALITY, w_pingpong: float = DEFAULT_W_PINGPONG,
                  w_churn: float = DEFAULT_W_CHURN, w_outage: float = DEFAULT_W_OUTAGE,
-                 w_smooth: float = DEFAULT_W_SMOOTH,
                  purge_sim_path_on_close: bool = False,
                  vary_rng_run_per_episode: bool = True,
                  reset_max_retries: int = 5,
@@ -352,7 +659,6 @@ class MroZmqEnv(NsOranEnv):
         self.w_pingpong = float(w_pingpong)
         self.w_churn = float(w_churn)
         self.w_outage = float(w_outage)
-        self.w_smooth = float(w_smooth)
 
         self.purge_sim_path_on_close = bool(purge_sim_path_on_close)
         self.vary_rng_run_per_episode = bool(vary_rng_run_per_episode)
@@ -360,12 +666,12 @@ class MroZmqEnv(NsOranEnv):
         self.reset_retry_count = 0
 
         self.observation_space = gym.spaces.Box(low=OBS_LOW, high=OBS_HIGH, dtype=np.float32)
-        self.action_space = gym.spaces.Box(low=-MARGIN_LIMIT_DB, high=MARGIN_LIMIT_DB,
-                                           shape=(len(CELLS),), dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=-ROLE_DELTA_MAX_DB, high=ROLE_DELTA_MAX_DB,
+                                           shape=(2,), dtype=np.float32)
 
-        # Rolling handover history for cross-step ping-pong detection -- same
-        # mechanics as MlbZmqEnv._handover_history (a bounce can straddle two
-        # control steps, so a single payload is not enough to detect it).
+        # Rolling handover history for cross-step ping-pong/churn detection --
+        # same mechanics as MlbZmqEnv._handover_history (a bounce can straddle
+        # two control steps, so a single payload is not enough to detect it).
         self._handover_history: list = []
         # Per-IMSI SINR from the previous step, for HandoverQuality's
         # before/after comparison. Cleared on every start_sim() like the
@@ -377,6 +683,15 @@ class MroZmqEnv(NsOranEnv):
         # to be compared against, so smoothness is defined as 0.0 there rather
         # than treated as an unmeasured/dropped term.
         self._last_action: Optional[np.ndarray] = None
+        # v3 pairwise-action state: PairRoleTracker computes this step's
+        # too-late/churn rates from the snapshot _reward_terms just saw
+        # (cached below as self._pair_rates for the NEXT step's action
+        # decision -- see _reward_terms and _pairwise_payload_from_action for
+        # the full ordering rationale); PairMarginState holds the
+        # rate-limited, clamped per-pair offsets actually applied.
+        self._pair_tracker = PairRoleTracker()
+        self._pair_margin_state = PairMarginState()
+        self._pair_rates: tuple = ({}, {})
 
         self.zmq_db: Optional[ZmqStateDatabase] = None
         self._pending_kpis: Optional[dict] = None
@@ -421,6 +736,9 @@ class MroZmqEnv(NsOranEnv):
         self._handover_history = []
         self._last_ue_sinr = {}
         self._last_action = None
+        self._pair_tracker = PairRoleTracker()
+        self._pair_margin_state = PairMarginState()
+        self._pair_rates = ({}, {})
 
         command = [self.script_executable] + [f'--{param}={value}' for param, value in parameters.items()]
         self.sim_result['meta']['start_time'] = time.time()
@@ -479,28 +797,46 @@ class MroZmqEnv(NsOranEnv):
         self.truncated = True
         return self._zero_obs(), {"reset_failed": True, "reset_attempts": attempts}
 
-    def _margin_from_action(self, action) -> dict:
-        """{cellId: {"ho_margin_db": dB}} for the action reply ns-3 is waiting on.
+    def _pairwise_payload_from_action(self, action) -> tuple:
+        """({srcCellId: {"ho_margin_pairs": {dstCellId: dB}}}, the 2-element
+        role-gain array actually applied, {(src,dst): offset_db}) for the
+        action reply ns-3 is waiting on.
 
-        action[i] -> cell CELLS[i], clipped to +-MARGIN_LIMIT_DB. Only cells
-        present in the pending snapshot are addressed, mirroring
-        MlbZmqEnv._cio_from_action. See the class docstring: ns-3 does not yet
-        act on this key, so sending it is currently a no-op.
+        action is the agent's ADDITIVE correction to the two fixed base
+        gains, clamped to +-ROLE_DELTA_MAX_DB; the combined gain is then
+        clamped to [0, MARGIN_LIMIT_DB] before being used as a role gain
+        (never negative -- role correction DIRECTION is fixed by the
+        literature-grounded role definition, see the v3 module docstring;
+        only the magnitude is learned/tunable). Reacts to
+        self._pair_rates, the too-late/churn rates computed from the most
+        recently RECEIVED snapshot (cached by _reward_terms at the end of
+        the previous step) -- same "react to what has been observed so far"
+        timing v2c's own window+cadence design used.
         """
-        cells = self._pending_kpis.get("cells", {})
-        values = np.asarray(action, dtype=np.float32).reshape(-1)
-        if values.size != len(CELLS):
-            raise ValueError(f'action must have {len(CELLS)} entries (one margin offset per '
-                             f'cell {CELLS}), got {values.size}')
-        values = np.clip(values, -MARGIN_LIMIT_DB, MARGIN_LIMIT_DB)
-        return {str(cell): {"ho_margin_db": float(values[i])}
-                for i, cell in enumerate(CELLS) if str(cell) in cells}, values
+        delta = np.clip(np.asarray(action, dtype=np.float32).reshape(-1),
+                        -ROLE_DELTA_MAX_DB, ROLE_DELTA_MAX_DB)
+        if delta.size != 2:
+            raise ValueError(f'action must have 2 entries (too_late_gain_delta, '
+                             f'churn_gain_delta), got {delta.size}')
+        gains = np.clip(np.array([BASE_TOO_LATE_GAIN_DB, BASE_CHURN_GAIN_DB],
+                                 dtype=np.float32) + delta, 0.0, MARGIN_LIMIT_DB)
+
+        too_late_rate, churn_rate = self._pair_rates
+        targets = _pairwise_margin_targets(too_late_rate, churn_rate,
+                                           float(gains[0]), float(gains[1]))
+        offsets = self._pair_margin_state.step(targets)
+
+        cells_payload: dict = {}
+        for (src, dst), offset_db in offsets.items():
+            cells_payload.setdefault(str(src), {}).setdefault(
+                "ho_margin_pairs", {})[str(dst)] = offset_db
+        return cells_payload, delta, offsets
 
     def step(self, action):
         if self._pending_kpis is None:
             return self._zero_obs(), 0.0, self.terminated, self.truncated, {}
 
-        cell_actions, margin = self._margin_from_action(action)
+        cell_actions, action_delta, pair_offsets = self._pairwise_payload_from_action(action)
         action_payload = {
             "timestamp": self._pending_kpis.get("timestamp", 0.0),
             "cells": cell_actions,
@@ -529,12 +865,14 @@ class MroZmqEnv(NsOranEnv):
             # just surfaces it instead of discarding it.
             exit_code = self.sim_result.get('meta', {}).get('exitcode')
             info = {"kpis": last_kpis, "margin_offsets": cell_actions,
+                    "pair_margins_db": pair_offsets,
                     "ns3_exit_code": exit_code, "crashed": exit_code not in (0, None)}
             return obs, 0.0, self.terminated, self.truncated, info
 
         self._pending_kpis = next_kpis
-        terms = self._reward_terms(next_kpis, margin)
-        info = {"kpis": next_kpis, "margin_offsets": cell_actions, "reward_terms": terms}
+        terms = self._reward_terms(next_kpis, action_delta)
+        info = {"kpis": next_kpis, "margin_offsets": cell_actions,
+                "pair_margins_db": pair_offsets, "reward_terms": terms}
         return self._get_obs(next_kpis), terms["reward"], False, False, info
 
     def _zero_obs(self) -> np.ndarray:
@@ -564,9 +902,10 @@ class MroZmqEnv(NsOranEnv):
         A cell absent from the snapshot contributes an all-zero block except
         SINR, which gets SINR_FLOOR_DB like MlbZmqEnv -- 0 dB is a good link,
         so zero-filling it would read an absent/silent cell as healthy.
-        last_margin_db reads self._last_action, which is None until the first
-        step() of an episode; reset()'s observation therefore reports 0.0 dB
-        for every cell, correctly reflecting that no margin has been applied yet.
+        last_pair_margin_db reads self._pair_margin_state, which is empty
+        until the first step() of an episode applies a nonzero pair offset;
+        reset()'s observation therefore reports 0.0 dB for every cell,
+        correctly reflecting that no margin has been applied yet.
         """
         cells = (kpis or {}).get("cells", {})
         row = np.zeros(self.observation_space.shape, dtype=np.float32)
@@ -582,24 +921,24 @@ class MroZmqEnv(NsOranEnv):
             sinr = self._cell_sinr_mean(cell_kpis) if cell_kpis else None
             touches = sum(1 for _, _, src, dst in handovers if src == cell or dst == cell)
             activity = (touches / active_ues_network) if active_ues_network > 0 else 0.0
-            last_margin = float(self._last_action[i]) if self._last_action is not None else 0.0
+            touching = self._pair_margin_state.offsets_touching(cell)
+            last_pair_margin = (sum(abs(v) for v in touching) / len(touching)) if touching else 0.0
             row[i * len(OBS_FIELDS):(i + 1) * len(OBS_FIELDS)] = (
                 (SINR_FLOOR_DB if sinr is None else sinr) / SINR_SCALE_DB,
                 cell_kpis.get("num_active_ues", 0) / ue_scale,
                 _sinr_bad_fraction(cell_kpis),
                 activity,
-                last_margin / MARGIN_LIMIT_DB,
+                last_pair_margin / MARGIN_LIMIT_DB,
             )
         return np.clip(row, OBS_LOW, OBS_HIGH).astype(np.float32)
 
-    def _reward_terms(self, kpis: dict, action: np.ndarray) -> dict:
-        """The five-term MRO reward, plus its breakdown and diagnostics.
+    def _reward_terms(self, kpis: dict, action_delta: np.ndarray) -> dict:
+        """The four-term MRO reward, plus its breakdown and diagnostics.
 
             reward = w_quality   * HandoverQuality
                    - w_pingpong  * PingPong
                    - w_churn     * HandoverRate
                    - w_outage    * OutageExposure
-                   - w_smooth    * ActionSmoothness
 
         See docs/mro_reward_design.pdf for the full rationale and the ns-3
         source audit behind each term, in particular why HandoverQuality
@@ -608,6 +947,10 @@ class MroZmqEnv(NsOranEnv):
         can report failure, so a literal success rate would read a constant
         1.0 in this simulator) and why OutageExposure replaces a literal RLF
         rate (RLF detection is confirmed dead code in this ns-3 fork).
+
+        ActionSmoothness is NOT in the sum (REWARD_FORMULA_VERSION 2) -- see
+        DEFAULT_W_OUTAGE's neighbouring module-level comment for why. It is
+        still computed and returned below, diagnostic-only.
 
         HandoverQuality and PingPong/HandoverRate are dropped from the sum
         (not scored 0) when they cannot be measured this step, matching
@@ -694,6 +1037,16 @@ class MroZmqEnv(NsOranEnv):
             pingpong = ((pingpong_count / active_ues) * handover_rate_scale
                         if active_ues > 0 else 0.0)
 
+        # --- v3 pair-role rates, cached for the NEXT step's action decision -
+        # Must run AFTER self._handover_history has been extended with THIS
+        # step's handovers (just above) -- PairRoleTracker's churn pairing
+        # needs the history to already include them, identical ordering
+        # requirement to PingPong's own detector just above. Runs even when
+        # handovers_unavailable (degrades to all-zero churn rates, same
+        # graceful-degradation spirit as the rest of this function; NOT
+        # added to terms_present since it is not a reward term).
+        self._pair_rates = self._pair_tracker.update(kpis, handovers, self._handover_history)
+
         # --- HandoverQuality ---------------------------------------------------
         # Did the destination cell's SINR actually beat the source cell's? Only
         # scored for handovers where both a before-SINR (this env's own memory
@@ -717,14 +1070,17 @@ class MroZmqEnv(NsOranEnv):
                     quality_good += 1
             quality = (quality_good / quality_measured) if quality_measured > 0 else None
 
-        # --- ActionSmoothness ---------------------------------------------------
-        margin = np.asarray(action, dtype=np.float32).reshape(-1)
+        # --- ActionSmoothness (diagnostic only -- not in the sum, see
+        # DEFAULT_W_OUTAGE's neighbouring comment and REWARD_FORMULA_VERSION).
+        # v3: compares the 2-dim role-gain DELTA step to step, not a 7-dim
+        # per-cell margin -- same mean-squared-delta shape, smaller vector. ---
+        margin = np.asarray(action_delta, dtype=np.float32).reshape(-1)
         if self._last_action is None:
             smoothness = 0.0
         else:
             smoothness = float(np.mean((margin - self._last_action) ** 2))
 
-        reward = -self.w_outage * outage - self.w_smooth * smoothness
+        reward = -self.w_outage * outage
         if quality is not None:
             reward += self.w_quality * quality
         if pingpong is not None:
@@ -742,10 +1098,9 @@ class MroZmqEnv(NsOranEnv):
             "pingpong": None if pingpong is None else float(pingpong),
             "handover_rate": None if handover_rate is None else float(handover_rate),
             "outage": float(outage),
-            "smoothness": float(smoothness),
+            "smoothness": float(smoothness),  # diagnostic only -- not in the sum
             "weights": {"quality": self.w_quality, "pingpong": self.w_pingpong,
-                        "churn": self.w_churn, "outage": self.w_outage,
-                        "smooth": self.w_smooth},
+                        "churn": self.w_churn, "outage": self.w_outage},
             "diagnostics": {
                 "active_ues": active_ues,
                 "n_ues_reporting_sinr": len(current_ue_sinr),
@@ -761,11 +1116,13 @@ class MroZmqEnv(NsOranEnv):
                 "quality_good": quality_good,
                 "quality_measured": quality_measured,
                 "outage_sinr_db": OUTAGE_SINR_DB,
-                "margin_action_db": dict(zip(CELLS, margin.tolist())),
+                "role_gain_delta_db": {"too_late": float(margin[0]), "churn": float(margin[1])},
                 # Built from what is actually in the sum, so a dropped term is
-                # never mistaken for one that scored zero.
+                # never mistaken for one that scored zero. smoothness is
+                # deliberately absent -- it's logged (see "smoothness" above)
+                # but never summed, so it was never "present" in this sense.
                 "terms_present": tuple(
-                    ["outage", "smoothness"]
+                    ["outage"]
                     + (["quality"] if quality is not None else [])
                     + (["pingpong"] if pingpong is not None else [])
                     + (["handover_rate"] if handover_rate is not None else [])),

@@ -7,14 +7,17 @@ anything, and PPO here is a stand-in for whichever algorithm training
 eventually uses (see docs/mro_reward_design.pdf); the point of this script is
 the pipeline, not the policy.
 
-IMPORTANT: as of this commit, MRO's action (per-cell handover-margin offset,
-sent as "ho_margin_db") reaches ns-3's LteEnbNetDevice::ApplyControlPayload and
-LteEnbRrc::SetHandoverMarginOffset -- that wiring compiled and linked cleanly
-into the scenario-marl-zmq binary. This script proves the ROUND TRIP works
-(action sent, KPIs and reward come back shaped correctly); it does not by
-itself prove the margin changes handover behaviour in a measurable way -- that
-needs a real A/B comparison (e.g. a large fixed offset on one cell vs none),
-which is future work, not this smoke test.
+IMPORTANT: as of v3 (2026-10-25), MRO's action is a 2-dim role-gain
+correction (too-late, churn), expanded internally into a per-(serving,
+target)-PAIR handover-margin offset sent as "ho_margin_pairs" -- see
+MroZmqEnv's class docstring. That reaches ns-3's
+LteEnbNetDevice::ApplyControlPayload and
+LteEnbRrc::SetHandoverMarginOffset(servingCellId, targetCellId, offsetDb),
+which compiled and linked cleanly into the scenario-marl-zmq binary. This
+script proves the ROUND TRIP works (action sent, KPIs and reward come back
+shaped correctly); it does not by itself prove the margin changes handover
+behaviour in a measurable way -- that needs a real A/B comparison, which is
+future work, not this smoke test.
 
 It is slow for the same reason as MLB's: every model.learn() timestep is one
 MroZmqEnv.step(), one scenario-marl-zmq control step over the ZeroMQ bridge.

@@ -1,27 +1,38 @@
-"""Measure OutageExposure's real scale under a condition that actually stresses
-it -- not the do-nothing baseline it was structurally silent on.
+"""Stress-test the LOOSEN direction: does a too-permissive margin reproduce
+the textbook "too-early handover" / ping-pong failure mode post-merge?
 
-docs/mro_training_fixes.md's round-2 baseline measured OutageExposure as
-alive (0.0001 mean, fired on 0.01% of UE-steps) but its literal equalised
-weight (159.7) was unusable: a term that rare swinging the reward that hard
-on the one step it fires is the same failure shape MLB's own BadSignal term
-hit. The shipped DEFAULT_W_OUTAGE (1.0) is a fixed guard value chosen BY
-ANALOGY to BadSignal's own precedent, not derived from a real measurement of
-OutageExposure under conditions where it actually fires meaningfully.
+ORIGINAL PURPOSE OF THIS SCRIPT (preserved in git history, data preserved in
+output/mro_outage_stress_terms_postfix2.csv): measuring OutageExposure under
+a +MARGIN_LIMIT_DB "sticky" tighten arm, the too-late-handover mechanism.
+That stress condition's own trajectory-ranking validation (sticky must score
+worse than doing nothing) PASSED pre-merge but FAILS on the current,
+post-merge/post-RLC-fix simulator -- recomputing it on fresh postfix2 data
+shows sticky now scoring BETTER than do-nothing on every term (quality,
+pingpong, handover_rate all improve). Ra'ed's SINR-filtering/hysteresis
+fixes plausibly removed enough of the physical-layer noise that made
+"do nothing" chaotic pre-merge that an artificially restrictive margin isn't
+the clean failure mode it used to be.
 
-This script is that measurement. The physical mechanism MRO's margin action
-can realistically use to manufacture real outage is well-grounded, not an
-arbitrary stress hack: margin_offset = +MARGIN_LIMIT_DB (+3 dB) on every cell
-makes GetEffectiveSinrThreshold MORE restrictive -- handovers trigger only on
-a much bigger target-cell SINR advantage, so a UE moving away from its
-serving cell stays latched onto it LONGER than it should. That is the
-textbook "too-late handover" MRO failure mode: lingering on a degrading
-serving cell before finally handing over is exactly what should drive real
-SINR outage. This mirrors mro_margin_experiment.py's already-validated
-"loosen" arm (-3 dB, confirmed +7% real ns-3 handover activity) but at the
-OPPOSITE, never-yet-tested extreme -- loosening makes handovers easier
-(irrelevant to outage), stickiness makes them harder (the actual outage
-mechanism).
+THIS RUN tests the symmetric, theoretically opposite mechanism instead:
+margin_offset = -MARGIN_LIMIT_DB (-3 dB) on every cell makes
+GetEffectiveSinrThreshold LESS restrictive -- handovers trigger on a smaller
+target-cell SINR advantage, so a UE can switch to a neighbour that is only
+marginally/noisily better. If that advantage flips back shortly after, the
+UE switches back -- exactly what PingPong is defined to catch (a
+return-handover within 0.8 s). Hysteresis margins exist in real 3GPP
+networks specifically to prevent this; it is the textbook "too-early
+handover" failure mode, the mirror image of what the tighten arm targeted.
+
+Caveat, stated plainly: a single-seed margin-effect sanity check this
+session (examples/mro_crash_backtrace.py-adjacent diagnostic, not this
+script) found loosen REDUCED raw completed-handover count (222 vs. 256 at
+neutral) for one seed -- the opposite of a naive "loosen -> more handovers"
+expectation, though not necessarily a contradiction of the ping-pong theory
+(TTT could be cancelling more marginal attempts before completion, which
+would suppress raw count while still being the instability this test is
+checking for). That diagnostic never measured pingpong or handover_rate.
+This is a real hypothesis test, not a confirmed result -- treat the outcome
+as genuine new evidence either way.
 
 Same seeded-episode / incremental-write method as mro_baseline_experiment.py,
 same locked SAC config (ues=5, simTime=30, controlInterval=0.1, RLC AM,
@@ -129,7 +140,7 @@ TERMS = ("quality", "pingpong", "handover_rate", "outage")
 
 
 def run_seed(seed: int, args, zmq_port: int) -> list:
-    """One fixed-sticky-margin episode; returns a list of per-step term dicts.
+    """One fixed-loosen-margin episode; returns a list of per-step term dicts.
 
     zmq_port is an explicit parameter, not read off `args`, so a parallel
     caller can hand each concurrently-running seed its own port -- see the
@@ -163,7 +174,7 @@ def run_seed(seed: int, args, zmq_port: int) -> list:
                     # docstring for the identical rationale.
                     build_ns3=False)
 
-    action = np.full(len(CELLS), MARGIN_LIMIT_DB, dtype=np.float32)  # +3 dB, sticky
+    action = np.full(len(CELLS), -MARGIN_LIMIT_DB, dtype=np.float32)  # -3 dB, loosen
     rows = []
     try:
         obs, info = env.reset(seed=seed)
@@ -331,7 +342,7 @@ if __name__ == "__main__":
     else:
         seeds = list(range(args.seed_start, args.seed_start + args.n_seeds))
 
-    print(f"Running {len(seeds)} fixed-sticky-margin (+{MARGIN_LIMIT_DB} dB) seeds: {seeds} "
+    print(f"Running {len(seeds)} fixed-loosen-margin (-{MARGIN_LIMIT_DB} dB) seeds: {seeds} "
           f"({'sequential' if args.workers <= 1 else f'{min(args.workers, len(seeds))} concurrent workers'})",
           flush=True)
     all_rows = []
@@ -350,7 +361,7 @@ if __name__ == "__main__":
         sys.exit("No usable rows collected -- every seed crashed or produced no steps.")
     print(f"\nWrote {len(all_rows)} total rows to {args.csv_out}", flush=True)
 
-    print("\n=== per-term statistics (pooled across seeds, sticky +3 dB arm) ===")
+    print("\n=== per-term statistics (pooled across seeds, loosen -3 dB arm) ===")
     print(f"{'term':<16} {'n':>6} {'mean':>10} {'raw_sd':>10} {'detrended_sd':>13}")
     stats = {}
     for term in TERMS:
@@ -362,7 +373,7 @@ if __name__ == "__main__":
 
     n_fired = sum(1 for r in all_rows if r["outage"] and r["outage"] > 0.0)
     print(f"\noutage fired on {n_fired}/{len(all_rows)} steps "
-          f"({100*n_fired/len(all_rows):.3f}%) under the sticky arm")
+          f"({100*n_fired/len(all_rows):.3f}%) under the loosen arm")
     print("(round-2 do-nothing baseline: fired on 0.01% of UE-steps -- compare the rate, "
           "not just the derived weight, to judge whether this arm genuinely stressed the term)")
 

@@ -26,8 +26,9 @@
 >   `analysis/EXPERIMENT_RESULTS.md` and `analysis/PHASE1_FINDINGS.md`
 > - **`MroZmqEnv`** (`src/environments/mro_zmq_env.py`), a Mobility Robustness
 >   Optimization environment that sets a per-cell handover-margin offset on the
->   same 7-cell topology, over the same ZeroMQ bridge -- work in progress,
->   reward weights not yet tuned and not yet exercised by a trained policy
+>   same 7-cell topology, over the same ZeroMQ bridge -- reward weights now
+>   measured and validated (see `docs/mro_training_fixes.md`), not yet
+>   exercised by a trained policy
 > - a compound cell-load metric and its validation tooling (`analysis/`)
 > - CIO experiment drivers (`examples/cio_experiment.py`, `examples/cio_zmq_experiment.py`,
 >   `examples/cio_headroom.py`)

@@ -342,3 +342,161 @@ None of the five have been checked against real MRO training rollouts yet --
 see the open items above (SAC pilot script, the crash-rate investigation,
 and re-measuring `PingPong`/`HandoverRate` once real training data exists)
 before starting a full training run.
+
+## ActionSmoothness dropped from the reward (REWARD_FORMULA_VERSION 1 -> 2)
+
+The first full MRO SAC pilot (8000 timesteps, 9000 gradient updates, critic
+calibration clean -- see the pilot report) showed why the `w_smooth=0.086`
+measurement above couldn't work as a shaping weight: it was calibrated
+against an UNTRAINED policy's random noise, not against a real learning
+signal. In the real pilot, `ActionSmoothness` was the only one of the five
+terms easy enough to improve that the agent fixated on it -- smoothness
+collapsed roughly 5x the moment gradient updates started, while `quality`,
+`handover_rate`, `pingpong` and `outage` never moved, early to late. The
+term's original justification also traces to an MLB-specific failure mode
+(an undamped controller oscillating 3 dB/step, flipping direction 7/10
+steps) imported by analogy -- never confirmed as an MRO problem of its own
+before being added to the design.
+
+**Change:** `ActionSmoothness` is no longer in the weighted sum. It is still
+computed and logged every step (`reward_terms["smoothness"]`) -- useful as a
+diagnostic for the next point below -- just no longer rewarded or penalised.
+`REWARD_FORMULA_VERSION` bumped 1 -> 2; any reward measured under v1 is not
+comparable to one measured under v2. Regression test:
+`test_action_smoothness_is_logged_but_not_rewarded` in
+`tests/test_mro_zmq_env.py`, mutation-tested (reverting the drop makes it
+fail, confirmed, then restored).
+
+Next steps per the pilot report: investigate alternative actions besides the
+margin offset (the loosen/tighten asymmetry found during that investigation
+suggests the current lever may not be the right one), and rerun the SAC
+pilot with the four-term reward before drawing further conclusions.
+
+## The real blocker: MRO's margin was wired into almost nothing (fixed)
+
+The loosen/tighten asymmetry flagged above turned out not to be a lever
+problem but a wiring problem. Under Ra'ed's locked config
+(`handoverMode=DynamicTtt`, `tttFromBiasedSinr=1`, `handoverHysteresisDb=0`),
+`LteEnbRrc::TttBasedHandover`'s PRIMARY trigger branch (the one that fires
+for the overwhelming majority of handovers) decided purely on
+`HysteresisAllowsHandover()`, which reads only `m_handoverHysteresisDb` and
+the CIO-biased SINR -- never `m_hysteresisMarginOffset`, MRO's own per-cell
+offset. `GetEffectiveSinrThreshold()` (which DOES fold in MRO's offset) was
+only consulted in one narrow secondary branch: re-evaluating an
+already-scheduled handover whose target cell changed mid-TTT-wait. In
+practice this meant MRO's action could almost never change what the
+simulator actually did -- fully explaining why `quality` / `handover_rate` /
+`pingpong` / `outage` stayed dead flat across all 8000 timesteps of the
+first pilot, independent of the `ActionSmoothness` problem above. Full trace
+and validation: `mro_investigation_log.md`.
+
+**Fix** (`src/lte/model/lte-enb-rrc.cc`, `TttBasedHandover`'s primary
+branch): require `sinrDifference > GetEffectiveSinrThreshold(maxSinrCellId)`
+alongside the existing `HysteresisAllowsHandover()` check before declaring a
+handover needed. `sinrDifference` is the raw (non-CIO-biased) SINR gap,
+already an in-scope parameter at this call site. This also restores the
+standard 3GPP-style 3dB base hysteresis (`m_sinrThresholdDifference`,
+ns-3's `HoSinrDifference` attribute) to the do-nothing baseline itself --
+that branch had no SINR-gap requirement at all before this fix, which is why
+every do-nothing baseline measured before this point in this document is now
+stale.
+
+Validated at increasing scale (1 -> 3 -> 15 seed x arm combinations, final
+batch at the full locked config: 5 seeds x {tighten +3dB, do-nothing, loosen
+-3dB}, simTime=30, 1,495 steps/arm): `handover_rate` and `pingpong` are
+monotonic in margin direction in every single seed-arm combination, zero
+exceptions, loosen's pingpong rate ~23x do-nothing's; `outage` is
+monotonically DECREASING as margin loosens (the symmetric too-late-handover
+mechanism) -- both classic 3GPP mobility-robustness failure modes now
+independently, cleanly reproduced by the same fix.
+
+**Weights re-derived a 3rd time** from the fixed-wiring do-nothing baseline
+(same detrended-sd method): `w_pingpong` 1.51 -> **9.39**, `w_churn` 0.80 ->
+**1.21**, `w_outage` kept at the fixed guard 1.0 (same rare-event rationale
+as before). The trajectory-ranking check (`mro_weight_ranking_check.py`) now
+PASSES for both failure modes -- tighten: mean reward 0.1320 vs do-nothing's
+0.1526 (gap +0.0206); loosen: -0.2323 vs 0.1526 (gap +0.3849, decisive).
+Under the OLD (pre-fix) weights, loosen had ranked BETTER than do-nothing
+(+0.2355 vs +0.2190) -- exactly backwards. These weights are only valid
+together with the wiring fix; do not use them against an unpatched binary.
+
+These weights are now `MroZmqEnv`'s defaults (`DEFAULT_W_PINGPONG`,
+`DEFAULT_W_CHURN`). `REWARD_FORMULA_VERSION` is unchanged at 2 (a weight
+retune, not a formula change, per this project's own versioning convention).
+
+## Second full SAC pilot (post-wiring-fix): trained, but worse than baseline
+
+With the wiring fix and new weights both in place, a full SAC pilot was
+trained for real: `n_envs=8`, `gradient_steps=24` (3.00 updates/sample),
+`learning_starts=5000`, `total_timesteps=12400`, seed 555. Ran 11h42m,
+completed cleanly (22,200 gradient updates, no crashes, no guard trips).
+
+The fix clearly works as designed -- MRO's action moved real KPIs during
+training for the first time in this project's history (`handover_rate`
+and `pingpong` both shifted measurably at the `learning_starts`
+boundary, where they had always stayed dead flat before). But the
+critic's Q-value diverged continuously throughout training (1.9 -> 79.3,
+no plateau -- a textbook SAC overestimation pattern), and the resulting
+policy drifted toward MORE handovers and MORE ping-pong, not fewer --
+the same too-early-handover failure mode this project's own stress test
+validated as bad.
+
+**Day-3 deterministic evaluation (5 seeds, matching the baseline's own
+seeds, same locked config, both datasets re-scored under the current
+weights for a fair comparison) confirms this is a real regression, not
+training-time noise:**
+
+| condition | mean reward | quality | pingpong | handover_rate | outage |
+|---|---|---|---|---|---|
+| do-nothing baseline | +0.1526 | 0.9357 | 0.0021 | 0.1216 | 0.00038 |
+| trained policy (deterministic) | -0.1265 | 0.8537 | 0.0315 | 0.1990 | 0.00050 |
+
+The trained policy loses on all 5 seeds. pingpong is ~15x higher,
+handover_rate ~64% higher, quality lower. **This checkpoint is not
+deployable.**
+
+**Takeaway:** the wiring fix was necessary but not sufficient. The
+remaining problem is almost certainly the unbounded critic overestimation
+seen throughout training, not the reward design or the action space
+(both were separately validated as correct via the fixed-wiring
+trajectory-ranking check). Next session should investigate: the
+gradient_steps/n_envs update ratio (24/8=3.00, sustained for a long run
+-- a known SAC destabiliser), the auto entropy coefficient's starting
+value (0.1, possibly too high for this action space, encouraging the
+policy to chase the overestimated Q into bad regions early and never
+recover), and whether reward clipping/normalization would help bound the
+critic's targets. Full details, plots and the per-phase training
+trajectory: `mro_investigation_log.md`, `output/fig_reward_kpis.pdf`,
+`output/fig_action_q.pdf`.
+
+## Third pilot attempt: decoupled gradient_steps + warm start
+
+Literature search confirmed the leading hypothesis directly (Hussing et
+al. 2024, arXiv:2403.05996: high update-to-data ratio causes exactly this
+kind of Q divergence). Relaunched with `gradient_steps` decoupled from
+`n_envs` (kept at a conservative absolute 8, not scaled to 24+ as
+`n_envs` rose to 12) and a warm start: the replay buffer is pre-filled
+with 3600 transitions from a new traditional rule-based MRO controller
+(`examples/mro_rule_based_controller.py`, modeled on the literature's
+closed-loop CIO/margin-vs-threshold pattern already used in commercial
+MRO) before SAC's own random-exploration phase, via a new
+`--warm_start_steps` flag on `train_mro_sac_pilot.py`. A real bug was
+caught and fixed during smoke-testing (`_store_transition` needs
+`model._last_obs` primed before being called standalone -- see
+`mro_investigation_log.md`'s 10-18 entry for the full isolation trace).
+No dedicated empirical burst-size reproduction was run before committing
+to this relaunch (time budget); the fix is literature-justified.
+
+**Result: the fix worked.** Critic Q stayed bounded with roughly-linear
+growth throughout 18,000 timesteps (final Q=11.3, vs the diverged run's
+Q=79.3 and still accelerating at the same budget) -- no divergence.
+Day-3 deterministic evaluation (5 seeds vs the do-nothing baseline):
+mean reward +0.1228 vs baseline's +0.1526, gap +0.0298 -- still a loss,
+but **89% smaller than the diverged run's +0.2791 gap**, and the trained
+policy wins outright on 1 of 5 seeds for the first time in this
+project's history. pingpong (the clearest signature of the "loosen/
+too-early" failure mode) dropped from ~15x baseline to ~2.6x baseline.
+Not yet a full pass; the most promising next step is simply more
+training budget now that the stability problem is solved. Full numbers:
+`mro_investigation_log.md`'s 2026-10-19 entries,
+`output/fig_combined_v3.pdf`, `output/mro_v3_trained_policy_eval.csv`.

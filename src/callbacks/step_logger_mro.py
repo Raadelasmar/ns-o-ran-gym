@@ -31,11 +31,15 @@ from stable_baselines3.common.callbacks import BaseCallback
 # Same 7-cell mmWave topology as MroZmqEnv.CELLS.
 _CELLS = [2, 3, 4, 5, 6, 7, 8]
 
-# Scalar terms of the reward, in the order they appear in the sum.
+# Scalar terms logged every step. smoothness is diagnostic-only (not in the
+# reward sum as of REWARD_FORMULA_VERSION 2) but still logged here -- it's
+# exactly the signal that showed the term needed dropping in the first place.
 _TERMS = ("quality", "pingpong", "handover_rate", "outage", "smoothness")
 
-# Diagnostic scalars from reward_terms["diagnostics"]. margin_action_db is
-# per-cell and emitted separately, below.
+# Diagnostic scalars from reward_terms["diagnostics"]. v3's per-pair offsets
+# (pair_margins_db) are emitted separately, below -- no fixed per-cell
+# columns for them any more (up to 42 directed pairs can be touched, a
+# variable and usually-sparse set, unlike v2's fixed 7 per-cell columns).
 _DIAG_FLAGS = ("handovers_unavailable",)
 _DIAG_NUMS = ("active_ues", "n_ues_reporting_sinr", "handovers_this_step",
               "handover_history_len", "handover_window_s", "handover_rate_scale",
@@ -49,9 +53,9 @@ FIELDS = (["wall_iso", "vec_step", "num_timesteps", "env_rank", "episode_index",
           + list(_DIAG_FLAGS)
           + list(_DIAG_NUMS)
           + ["ns3_exit_code", "crashed"]
-          + [f"action_raw_cell{c}" for c in _CELLS]
-          + [f"action_clipped_cell{c}" for c in _CELLS]
-          + [f"margin_action_db_cell{c}" for c in _CELLS]
+          + ["action_raw_too_late", "action_raw_churn",
+             "action_clipped_too_late", "action_clipped_churn",
+             "pair_margins_db_json"]
           + ["monitor_ep_r", "monitor_ep_l"])
 
 
@@ -120,7 +124,7 @@ class MroStepLogger(BaseCallback):
     def _write_meta(self) -> None:
         """Run-level constants, read off the live envs rather than re-declared."""
         meta = {"n_envs": self.training_env.num_envs, "cells": _CELLS, "fields": FIELDS}
-        for attr in ("w_quality", "w_pingpong", "w_churn", "w_outage", "w_smooth",
+        for attr in ("w_quality", "w_pingpong", "w_churn", "w_outage",
                      "total_ues", "scenario_configuration"):
             try:
                 meta[attr] = self._sanitise(self.training_env.get_attr(attr)[0])
@@ -176,7 +180,7 @@ class MroStepLogger(BaseCallback):
 
     def _row(self, stamp, i, info, rewards, dones, raw, clipped) -> dict:
         terms = (info or {}).get("reward_terms")
-        offsets = (info or {}).get("margin_offsets") or {}
+        pair_margins = (info or {}).get("pair_margins_db") or {}
         diag = (terms or {}).get("diagnostics") or {}
         ep = (info or {}).get("episode") or {}
 
@@ -214,18 +218,18 @@ class MroStepLogger(BaseCallback):
         for k in _DIAG_NUMS:
             row[k] = _f(diag.get(k))
 
-        margin_db = diag.get("margin_action_db") or {}
-        for j, c in enumerate(_CELLS):
-            row[f"action_raw_cell{c}"] = _f(raw[i][j]) if j < raw.shape[1] else ""
-            row[f"action_clipped_cell{c}"] = (_f(clipped[i][j]) if j < clipped.shape[1] else "")
-            # margin_action_db is keyed by int cell id (dict(zip(CELLS, ...))
-            # in mro_zmq_env.py), not str -- unlike offsets, which comes
-            # through the ZMQ/JSON payload and is str-keyed.
-            if c in margin_db:
-                row[f"margin_action_db_cell{c}"] = _f(margin_db[c])
-            else:
-                cell = offsets.get(str(c))
-                row[f"margin_action_db_cell{c}"] = _f(cell.get("ho_margin_db")) if cell else ""
+        row["action_raw_too_late"] = _f(raw[i][0]) if raw.shape[1] > 0 else ""
+        row["action_raw_churn"] = _f(raw[i][1]) if raw.shape[1] > 1 else ""
+        row["action_clipped_too_late"] = _f(clipped[i][0]) if clipped.shape[1] > 0 else ""
+        row["action_clipped_churn"] = _f(clipped[i][1]) if clipped.shape[1] > 1 else ""
+        # Sparse and variable-sized (up to 42 directed pairs) -- a compact
+        # JSON blob beats 42 mostly-empty fixed columns. Present on both
+        # "step" and "terminal" phases (MroZmqEnv.step() includes
+        # pair_margins_db in info either way), unlike the old per-cell
+        # margin_action_db, which needed a diagnostics/payload fallback.
+        row["pair_margins_db_json"] = (
+            json.dumps({f"{s}->{d}": v for (s, d), v in pair_margins.items()})
+            if pair_margins else "")
         return row
 
     def _read_rng_runs(self) -> None:

@@ -46,6 +46,9 @@ sys.path.insert(0, path.join(path.dirname(__file__), "..", "src"))
 from callbacks.critic_probe import CriticProbe                   # noqa: E402
 from callbacks.step_logger_mro import MroStepLogger               # noqa: E402
 from environments.mro_zmq_env import MroZmqEnv                   # noqa: E402
+from mro_rule_based_controller import RuleBasedMroControllerV3    # noqa: E402
+
+import numpy as np                                                # noqa: E402
 
 from stable_baselines3 import SAC                                # noqa: E402
 from stable_baselines3.common.callbacks import (BaseCallback, CallbackList,   # noqa: E402
@@ -306,12 +309,126 @@ def make_env(rank: int, args, cfg: dict, monitor_dir: str):
             vary_rng_run_per_episode=True,
             # Reward weights are NOT overridden here -- MroZmqEnv's own
             # DEFAULT_W_* constructor defaults apply (w_quality=1.00,
-            # w_pingpong=1.51, w_churn=0.80, w_outage=1.0, w_smooth=0.086),
-            # the validated values from docs/mro_training_fixes.md.
+            # w_pingpong=9.39, w_churn=1.21, w_outage=1.0; ActionSmoothness is
+            # no longer in the sum at all, REWARD_FORMULA_VERSION 2). These
+            # are the 3rd-generation weights, re-derived AFTER the
+            # lte-enb-rrc.cc TttBasedHandover wiring fix -- see
+            # mro_investigation_log.md and docs/mro_training_fixes.md. This
+            # fix must be present in the built ns-3 binary for these weights
+            # (and for MRO's action to have any real effect at all).
             purge_sim_path_on_close=True,
         )
         return Monitor(env, filename=path.join(monitor_dir, f"monitor_rank{rank}"))
     return _init
+
+
+def warm_start_collect(venv, model, n_steps: int) -> None:
+    """Pre-fill the replay buffer using v3's rule-based baseline (a constant
+    zero action -- see RuleBasedMroControllerV3's own docstring for why that
+    IS the traditional controller under v3's design, not an approximation of
+    it), instead of random exploration, before SAC's own learning_starts-
+    gated random-action phase. Does NOT advance model.num_timesteps -- these
+    transitions are additive to the training budget, not counted against it.
+    Uses the model's own _store_transition so terminal-observation / timeout
+    handling matches exactly what real training does (same ReplayBuffer,
+    same handle_timeout_termination semantics).
+
+    v2c (used for every warm start before v3) cannot be reused here: it
+    outputs a 7-dim per-cell margin, incompatible with v3's 2-dim role-gain
+    action space, and its own underlying ns-3 mechanism (per-target-cell-only
+    margin) no longer exists post-v3's pairwise keying.
+    """
+    obs = venv.reset()
+    # _store_transition reads self._last_obs internally as the transition's
+    # "obs" (not any local variable) -- this is normally set by SB3's own
+    # _setup_learn() before collect_rollouts ever calls it. Since we're
+    # calling it standalone, it must be primed the same way, or the very
+    # first stored transition's obs is whatever _last_obs defaulted to
+    # (None, from BaseAlgorithm.__init__) -- confirmed by reproducing a
+    # NaN-propagation crash on the first gradient step without this line.
+    model._last_obs = obs
+    controllers = [RuleBasedMroControllerV3() for _ in range(venv.num_envs)]
+    collected = 0
+    print(f"  warm-start: collecting {n_steps} transitions from v3's rule-based "
+          f"baseline (constant zero action = BASE_*_GAIN_DB) ...", flush=True)
+    while collected < n_steps:
+        actions = np.stack([controllers[i].act(obs[i])
+                            for i in range(venv.num_envs)]).astype(np.float32)
+        next_obs, rewards, dones, infos = venv.step(actions)
+        model._store_transition(model.replay_buffer, actions, next_obs, rewards, dones, infos)
+        obs = next_obs
+        collected += venv.num_envs
+    print(f"  warm-start DONE: {collected} transitions pre-loaded "
+          f"({model.replay_buffer.size()} rows x {model.replay_buffer.n_envs} lanes in "
+          f"the buffer now). model.num_timesteps unaffected ({model.num_timesteps}).",
+          flush=True)
+
+
+def zero_init_actor_mean(model) -> None:
+    """Zero-initialise SAC's actor mean-output layer so the UNTRAINED policy
+    reproduces v3's pure rule-based baseline exactly (action=0 -> the fixed
+    base gains, see environments/mro_zmq_env.py's action_space docstring),
+    the same warm-start property the manuscript's MLB recipe relies on
+    (Table 6.4). SB3's SACPolicy actor exposes the mean-output layer as
+    `actor.mu` (an nn.Linear); zeroing both its weight and bias makes the
+    actor's raw (pre-squash) mean output exactly 0 for any observation,
+    before any gradient step has run.
+    """
+    mu = model.policy.actor.mu
+    if not isinstance(mu, torch.nn.Linear):
+        # Only true if use_sde=True is ever passed to SAC() above (not the
+        # case for ARM_C) -- SB3 then wraps actor.mu in a Sequential/Hardtanh
+        # stack that this simple zero-init does not handle. Fail loudly
+        # rather than silently zero the wrong thing or skip the fix.
+        raise TypeError(f"actor.mu is {type(mu)}, not a plain nn.Linear -- "
+                        f"zero_init_actor_mean does not support use_sde=True")
+    with torch.no_grad():
+        mu.weight.zero_()
+        mu.bias.zero_()
+    print(f"  zero-init: actor.mu weight/bias zeroed ({tuple(mu.weight.shape)}) -- "
+          f"untrained policy now reproduces the base-gain rule exactly", flush=True)
+
+
+def critic_only_prefill(model, n_updates: int) -> None:
+    """Runs n_updates SAC gradient steps with the actor's parameters FROZEN,
+    so only the critics (and target critics) move -- lets the critic's Q
+    estimate become reliable against the warm-start-collected transitions
+    BEFORE any policy-gradient update can push the actor using a still-
+    unreliable critic. Mirrors the manuscript's MLB warm-start recipe
+    (Table 6.4: 5,000 critic-only updates before the first policy update).
+
+    Freezing via requires_grad rather than skipping the actor/entropy loss
+    block entirely: SAC's target-Q computation still needs a forward pass
+    through the actor for next-state action sampling (wrapped in
+    th.no_grad() by SB3's own train(), so this doesn't double up the no-grad
+    context, it just also stops the actor's OWN loss.backward() from
+    accumulating gradients into frozen leaf tensors -- the optimizer step on
+    them is then a correctly-behaved no-op, not a skipped call).
+    """
+    # model.train() reads self.logger (self._logger), which SB3 only sets up
+    # inside learn() -> _setup_learn(). Calling train() standalone BEFORE the
+    # first learn() call -- exactly how this is wired below, prefill runs
+    # before model.learn() -- hits an AttributeError without this. Harmless
+    # and idempotent to call again: set_logger() is also what _setup_learn()
+    # itself calls, so the real learn() call right after this just overwrites
+    # it the same way it always does.
+    if not hasattr(model, "_logger"):
+        from stable_baselines3.common.utils import configure_logger
+        model.set_logger(configure_logger(verbose=0))
+
+    actor_params = list(model.policy.actor.parameters())
+    was_trainable = [p.requires_grad for p in actor_params]
+    for p in actor_params:
+        p.requires_grad_(False)
+    try:
+        print(f"  critic-only prefill: {n_updates} gradient steps with the actor "
+              f"frozen ...", flush=True)
+        model.train(gradient_steps=n_updates, batch_size=model.batch_size)
+    finally:
+        for p, was in zip(actor_params, was_trainable):
+            p.requires_grad_(was)
+    print(f"  critic-only prefill DONE: {n_updates} updates, actor unfrozen, "
+          f"model._n_updates={getattr(model, '_n_updates', 'n/a')}", flush=True)
 
 
 def assert_actuals(model, venv, args, learn_budget):
@@ -401,6 +518,20 @@ if __name__ == "__main__":
     ap.add_argument("--mem_anon_ceiling_gb", type=float, default=MEM_ANON_CEILING_GB)
     ap.add_argument("--min_avail_gb", type=float, default=MIN_AVAIL_GB)
     ap.add_argument("--gradient_steps", type=int, default=ARM_C["gradient_steps"])
+    ap.add_argument("--warm_start_steps", type=int, default=0,
+                    help="transitions to pre-load into the replay buffer via the "
+                         "traditional rule-based MRO controller before training starts "
+                         "(additive, does not count against --total_timesteps); 0 disables")
+    ap.add_argument("--critic_prefill_updates", type=int, default=0,
+                    help="SAC gradient steps to run with the actor frozen (critic-only), "
+                         "after warm-start collection and before normal training; mirrors "
+                         "the manuscript's MLB recipe (Table 6.4: 5000); 0 disables. Has no "
+                         "effect on --resume_from (a resumed model's critic is already "
+                         "trained)")
+    ap.add_argument("--no_zero_init_actor", action="store_true",
+                    help="skip zero-initialising the actor's mean-output layer on a fresh "
+                         "model (on by default: makes the untrained policy reproduce v3's "
+                         "rule-based baseline exactly, see zero_init_actor_mean)")
     ap.add_argument("--rb_save_every", type=int, default=500,
                     help="save the replay buffer every N aggregate timesteps")
     ap.add_argument("--resume_from", default=None,
@@ -482,6 +613,10 @@ if __name__ == "__main__":
     print(f"  mem guard        anon ceiling {args.mem_anon_ceiling_gb} GB, "
           f"MemAvailable floor {args.min_avail_gb} GB", flush=True)
     print(f"  replay buffer    saved every {args.rb_save_every} timesteps", flush=True)
+    print(f"  zero-init actor  {'OFF (--no_zero_init_actor)' if args.no_zero_init_actor else 'ON'}",
+          flush=True)
+    print(f"  critic prefill   {args.critic_prefill_updates} updates (actor frozen)"
+          + ("" if args.critic_prefill_updates > 0 else "  (disabled)"), flush=True)
     print(f"  logs             {log_dir}", flush=True)
     print("=" * 78, flush=True)
 
@@ -492,6 +627,9 @@ if __name__ == "__main__":
                    "updates_per_sample": updates_per_sample,
                    "expected_gradient_updates": expected_updates,
                    "probe_obs": path.abspath(args.probe_obs),
+                   "warm_start_steps": args.warm_start_steps,
+                   "critic_prefill_updates": args.critic_prefill_updates,
+                   "zero_init_actor": not args.no_zero_init_actor,
                    "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "mlb_ppo_pilot_baseline_for_reference_only": "AGENT_BUILD_LOG.md Step 11a-11c"},
                   fh, indent=2)
@@ -531,7 +669,13 @@ if __name__ == "__main__":
                      f"Raise --total_timesteps or there is nothing to do.")
     else:
         model = SAC("MlpPolicy", venv, seed=args.seed, verbose=1, device="cpu", **hypers)
+        if not args.no_zero_init_actor:
+            zero_init_actor_mean(model)
         learn_budget = args.total_timesteps
+        if args.warm_start_steps > 0:
+            warm_start_collect(venv, model, args.warm_start_steps)
+        if args.critic_prefill_updates > 0:
+            critic_only_prefill(model, args.critic_prefill_updates)
 
     ckpt = CheckpointCallback(save_freq=max(1000 // args.n_envs, 1),
                               save_path=args.save_dir, name_prefix="mro_sac")

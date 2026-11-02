@@ -71,7 +71,7 @@ def collect_seed(seed: int, args, zmq_port: int) -> np.ndarray:
                     vary_rng_run_per_episode=False,
                     purge_sim_path_on_close=True)
 
-    action = np.zeros(len(CELLS), dtype=np.float32)
+    action = np.zeros(2, dtype=np.float32)  # v3: 2-dim role-gain action, zero = rule baseline
     obs_rows = []
     try:
         obs, info = env.reset(seed=seed)
